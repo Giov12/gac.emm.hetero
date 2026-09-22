@@ -67,7 +67,7 @@ public:
         if (this->exons.empty()){
             return;
         }
-        
+
         vector<Exon> resolved;
 
         const int count = this->exons.size();
@@ -660,10 +660,11 @@ write_output(unordered_map<string, vector<Gene *>> &genome, unordered_map<string
             gene_hetero = gene->calc_hetero();
             
             // now write it out to the table
+            cerr << std::fixed << std::setprecision(5);
             for (uint k = 0; k < pops.size(); k++){
                 auto ktr      = gene_hetero.find(pops[k]); // when no sites found
                 double hetero = ktr != gene_hetero.end() ? ktr->second : -1.0;
-                fh << '\t' << setprecision(5) << hetero; 
+                fh << '\t' << hetero; 
             }
             fh << '\n';
             // we are done with this gene
