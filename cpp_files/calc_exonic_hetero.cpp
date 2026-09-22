@@ -376,6 +376,7 @@ parse_annotation(const string &ann, unordered_map<string, vector<Gene*>> &genome
 
         chrom_genes.reserve(genes.size()); // reserve enough space
         for (auto jtr = genes.begin(); jtr != genes.end(); jtr++){
+            jtr->second->resolve_exons(); // deduplicate & collapse overlapping exons
             chrom_genes.push_back(std::move(jtr->second));
         }
 
