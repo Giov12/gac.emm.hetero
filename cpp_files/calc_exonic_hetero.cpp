@@ -50,32 +50,60 @@ public:
 
     void add_exon(Exon exon){
         //
-        // avoid adding duplicated exons
-        // or exons that partially or completely
-        // overlap
+        // just add the exon for now
+        // & then we will resolve
+        // the exons at the end
         //
-        uint i = 0;
-
-        while (i < this->exons.size()){
-            // we need to merge these
-            if (exon.start <= this->exons[i].end && 
-                exon.end >= this->exons[i].start){
-                if (this->exons[i].start < exon.start){
-                    exon.start = this->exons[i].start;
-                }
-                if (this->exons[i].end > exon.end){
-                    exon.end = this->exons[i].end;
-                }
-                // this will shrink the exons size,
-                // effectively bringing i closer to .size()
-                this->exons.erase(this->exons.begin() + i);
-            }
-            else {
-                i++;
-            }
-        }
 
         this->exons.push_back(exon);
+    }
+
+    void resolve_exons(void){
+        //
+        // de-duplicate & merge overlapping exons
+        //
+
+        // edge-case
+        if (this->exons.empty()){
+            return;
+        }
+        
+        vector<Exon> resolved;
+
+        const int count = this->exons.size();
+        resolved.reserve(count);
+
+        //
+        // sort to then just go exon by exon
+        //
+        sort(this->exons.begin(), this->exons.end(), []
+            (const Exon &exon1, const Exon &exon2){
+                if (exon1.start == exon2.start){
+                    return exon1.end < exon2.end;
+                }
+                return exon1.start < exon2.start;
+            }
+        );
+
+        resolved.push_back(exons.front());
+        int i = 1;
+
+        while (i < count){
+            Exon &prev = resolved.back();
+            Exon &next = this->exons[i];
+
+            // is there overlap?
+            if (next.start <= prev.end){
+                if (next.end > prev.end){ // merge if true
+                    prev.end = next.end;
+                }
+            }
+            else {
+                resolved.push_back(next);
+            }
+            i++;
+        }
+        this->exons = resolved;
     }
 
     void add_pop_genos(const uint pos, const string pop, vector<string> &genos){
