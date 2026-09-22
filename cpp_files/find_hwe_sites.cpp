@@ -185,21 +185,14 @@ parse_table(const string &table){
             exit(1);  
         }
     }
-    //
-    // sample -> number of missing sites for this sample
-    //
-    
-
+  
     vector<string> parts;
     vector<uint> ref_pops, het_pops;
     vector<string> samples;
     string   line, pop, column;
     bool     eof = false; // default value
 
-    //
-    // calculate heterozygosity at every exonic
-    // site for each population
-    //
+    // some counters
     uint total_sites = 0, line_cnt = 0, total_markers = 0;
 
     while (true){
