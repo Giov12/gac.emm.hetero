@@ -36,6 +36,11 @@ struct Exon {
     uint end;
 };
 
+struct Attribute {
+    string key;
+    string val;
+};
+
 struct Counts {
     uint exonic;
     uint intronic;
@@ -49,6 +54,7 @@ private:
 
 public:
     string       id;
+    string       name;
     uint         start;
     uint         end;
     vector<Exon> exons;
@@ -56,8 +62,9 @@ public:
     //
     // empty constructor
     //
-    Gene (string id_, uint start, uint end){
+    Gene (string id_, string name, uint start, uint end){
         this->id    = id_;
+        this->name  = name;
         this->start = start;
         this->end   = end;
     };
@@ -257,19 +264,22 @@ parse_tabular(string &line, vector<string> &parts){
     return 0;
 }
 
-string
-get_geneid(string &attributes){
+void
+parse_attributes(string &attributes, vector<Attribute> &atrbVec){
 
     //
     // get the gene_id from a ';' delimited string
+    // if we only want the gene_id
     //
 
     if (attributes.empty()){
-        return "";
+        return;
     }
 
     size_t start = 0, next = string::npos, length = attributes.size();
     string part;
+
+    atrbVec.clear(); // ensure new entries
 
     // iterate over a ';' delimited string
     while (start <= length){
@@ -293,9 +303,7 @@ get_geneid(string &attributes){
                 if (value.size() >= 2 && value[0] == '"' && value.back() == '"'){
                     value = value.substr(1, value.size() - 2);
                 }
-                if (key == "gene_id"){
-                    return value; // found it
-                }
+                atrbVec.push_back({key, value});
             }
        }
         // we reached the end
@@ -304,8 +312,6 @@ get_geneid(string &attributes){
         }
         start = next + 1;
     }
-
-    return "";
 }
 
 int
@@ -335,8 +341,9 @@ parse_annotation(const string &ann, unordered_map<string, vector<Gene*>> &genome
     // create the objects we need to store info
     //
     vector<string> parts;
+    vector<Attribute> atrbVec;
     Gene *g;
-    string line, chrom, gene_id;
+    string line, chrom, gene_id, gene_name;
     uint start, end;
     bool eof;
 
@@ -372,8 +379,22 @@ parse_annotation(const string &ann, unordered_map<string, vector<Gene*>> &genome
         }
 
         if (parts[2] == "gene" || parts[2] == "exon"){
+
+            if (parts[8].back() == '\n'){
+                parts[8].pop_back(); // strip new line char
+            }
             // grab the gene_id for this gene
-            gene_id = get_geneid(parts[8]);
+            parse_attributes(parts[8], atrbVec);
+            gene_id   = "";
+            gene_name = "";
+            for (uint i = 0; i < atrbVec.size(); i++){
+                if (atrbVec[i].key == "gene_id"){
+                    gene_id = atrbVec[i].val;
+                }
+                else if (atrbVec[i].key == "gene_name"){
+                    gene_name = atrbVec[i].val;
+                }
+            }
             if (gene_id.empty()){
                 cerr << "Unable to get gene_id for the following record:\n" << line;
                 exit(1);
@@ -382,12 +403,17 @@ parse_annotation(const string &ann, unordered_map<string, vector<Gene*>> &genome
             start = (uint)stoi(parts[3]);
             end   = (uint)stoi(parts[4]);
             if (parts[2] == "gene"){
-                g = new Gene(gene_id, start, end);
+                g = new Gene(gene_id, gene_name, start, end);
                 gene_map[chrom][gene_id] = g;
             }
-            else {
+            else if (gene_map[chrom].find(gene_id) != gene_map[chrom].end()) {
                 Exon exon{start, end};
                 gene_map[chrom][gene_id]->add_exon(exon);
+            }
+            else {
+                cerr << "Malformed annotations. Exon came before gene entry. "
+                     << "Offending line:\n" << line;
+                exit(1);
             }
         } // end of exon parsing
     } // end of parsing
@@ -625,7 +651,7 @@ write_output(unordered_map<string, vector<Gene*>> &genome, const uint overlappin
     if (overlapping > 0){
         // only write if there's something to report
         fh.open("Genes_with_hetero_snps.tsv");
-        fh << "#GeneID\tExonic\tIntronic\n";
+        fh << "#GeneID\tGeneName\tExonic\tIntronic\n";
     }    
 
     for (auto itr = genome.begin(); itr != genome.end(); itr++){
@@ -633,8 +659,10 @@ write_output(unordered_map<string, vector<Gene*>> &genome, const uint overlappin
         for (uint i = 0; i < genes->size(); i++){
             Gene* gene = (*genes)[i];
             if (overlapping > 0 && gene->has_marker()){
-                Counts c = gene->get_counts();
-                fh << gene->id << '\t' << c.exonic << '\t' << c.intronic << '\n';
+                Counts c    = gene->get_counts();
+                string name = gene->name.empty() ? "NotFound": gene->name;
+                fh << gene->id << '\t' << name       << '\t'
+                   << c.exonic << '\t' << c.intronic << '\n';
             }
             delete gene;
         }
