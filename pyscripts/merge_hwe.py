@@ -12,9 +12,14 @@ def get_arguments() -> int:
 
     global hwe_files, outfile
 
-    parser = argparse.ArgumentParser(description="Merge hwe tables with matching SNPs generated from vcftools --hardy")
-    parser.add_argument("-H", "--hwe-files", required=True, nargs='*', help="One or more tables generated from vcftools hardy")
-    parser.add_argument("-o", "--out", type=str, help="name of output [optional]", default=outfile)
+    # help messages & description
+    desc  = "Merge hwe tables with matching SNPs generated from vcftools --hardy"
+    hhelp = "One or more tables generated from vcftools hardy"
+    ohelp = "name of output [optional]"
+
+    parser = argparse.ArgumentParser(description=desc)
+    parser.add_argument("-H", "--hwe-files", required=True, nargs='*', help=hhelp)
+    parser.add_argument("-o", "--out", type=str, help=ohelp, default=outfile)
 
     args = parser.parse_args()
     hwe_files = args.hwe_files

@@ -23,10 +23,16 @@ def get_arguments() -> int:
 
     global cov_path, fai_file, min_len
 
-    parser = argparse.ArgumentParser(description="Plot the coverages from a set of depth files")
-    parser.add_argument("-d", "--dir", required=True, type=str, help="directory containing the depth files")
-    parser.add_argument("-f", "--fai", required=True, type=str, help="fasta index file with the lengths of the chromosomes")
-    parser.add_argument("-m", "--min", type=int, help="Minimum length of chromosome to include [default: 0]", default=min_len)
+    # help messages & description
+    desc  = "Plot the coverages from a set of depth files"
+    dhelp = "directory containing the depth files"
+    fhelp = "fasta index file with the lengths of the chromosomes"
+    mhelp = "Minimum length of chromosome to include [default: 0]"
+
+    parser = argparse.ArgumentParser(description=desc)
+    parser.add_argument("-d", "--dir", required=True, type=str, help=dhelp)
+    parser.add_argument("-f", "--fai", required=True, type=str, help=fhelp)
+    parser.add_argument("-m", "--min", type=int, help=mhelp, default=min_len)
 
     args = parser.parse_args()
 
