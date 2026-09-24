@@ -159,7 +159,7 @@ pop_of_interest(const string &pop){
 }
 
 int
-parse_table(const string &table){
+parse_table(const string &table, const bool alternative){
 
     //
     // this function will be the main work horse for this
@@ -237,6 +237,11 @@ parse_table(const string &table){
             continue;
         }
 
+        if (alternative && ref_pops.size() != 2){
+            cerr << "Error: Currently enforcing alternative alleles is restricted to 2 reference populations.\n";
+            exit(1);
+        }
+
         total_sites++;
 
         //
@@ -247,6 +252,7 @@ parse_table(const string &table){
         // i.e., this site isn't completely missing
         //
         bool candidate = true;
+        vector<Entry> temp; // only used for enforcing alternatives
         for (uint i = 0; i < ref_pops.size(); i++){
             Entry e;
             column = parts[ref_pops[i]];
@@ -255,13 +261,38 @@ parse_table(const string &table){
                 candidate = false;
                 break;
             }
+            else if (alternative){
+                temp.push_back(e);
+            }
         }
 
         // not useful for our study
         if (!candidate){
             continue;
         }
-        
+        else if (alternative){
+            Entry &ref1 = temp.front();
+            Entry &ref2 = temp.back();
+
+            // either population has both genotypes
+            if (ref1.homo_ref > 0 && ref1.homo_alt > 0){
+                candidate = false;
+            }
+            else if (ref2.homo_ref > 0 && ref2.homo_alt > 0){
+                candidate = false;
+            }
+            // check that the two genotypes are different
+            else if (ref1.homo_ref > 0 && ref2.homo_ref > 0){
+                candidate = false;
+            }
+            else if (ref1.homo_alt > 0 && ref2.homo_alt > 0){
+                candidate = false;
+            }
+
+            if (!candidate){
+                continue;
+            }
+        }
         // now to verify that the other ref populations are heterozygous
         candidate = true;
         for (uint i = 0; i < het_pops.size(); i++){
@@ -307,13 +338,14 @@ parse_table(const string &table){
 
 void
 help(){
-    cerr << "Usage: ./find_hwe_sites.cpp -t merged_hwe.tsv.gz\n";
+    cerr << "Usage: ./find_hwe_sites.cpp -t merged_hwe.tsv.gz [required] -f [optional filter]\n";
     exit(1);
 }
 
 int main(int argc, char *argv[]){
 
     string table;
+    bool alternative = false;
     
     // expect at least a single argument
     if (argc < 2){
@@ -324,6 +356,9 @@ int main(int argc, char *argv[]){
         string arg = argv[i];
         if (arg == "-t" && i + 1 < argc){
             table = string(argv[i + 1]);
+        }
+        if (arg == "-f"){
+            alternative = true;
         }
         else if (arg == "-h"){
             help();
@@ -339,7 +374,7 @@ int main(int argc, char *argv[]){
     }
 
     // parse the table
-    parse_table(table);
+    parse_table(table, alternative);
 
     return 0;
 }
