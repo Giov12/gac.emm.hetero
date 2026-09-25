@@ -11,6 +11,7 @@
 using std::string;
 using std::fstream;
 using std::ofstream;
+using std::ifstream;
 using std::unordered_map;
 using std::vector;
 using std::cerr;
@@ -106,7 +107,7 @@ public:
         this->exons = resolved;
     }
 
-    void add_pop_genos(const uint pos, const string pop, vector<string> &genos){
+    void add_pop_genos(const uint pos, const string pop, const double percent_hetero){
 
         //
         // tally the number of heteros for this population
@@ -126,30 +127,10 @@ public:
             return;
         }
 
-        if (genos.empty()){
-            // due to missing data
-            this->sites[pop].push_back(-1.0);
-            return;
-        }
-
-        uint hets = 0; 
-        for (uint i = 0; i < genos.size(); i++){
-            const string &geno = genos[i];
-            // either delimiter is valid
-            size_t p = geno.find_first_of("/|");
-            if (p == string::npos){
-                continue; // not valid, haploid call?
-            }
-            if (geno.substr(0, p) != geno.substr(p + 1)){
-                hets++; // different alleles
-            }
-        } // end of i
-
-        // get fraction of hetero individuals
-        this->sites[pop].push_back(((double)hets / genos.size()));
+        this->sites[pop].push_back(percent_hetero);
     }
 
-    unordered_map<string, double> calc_hetero(void) const{
+    unordered_map<string, double> calc_hetero(void) const {
         //
         // return the level of heterozygosity at this gene
         // for each pop
@@ -164,17 +145,13 @@ public:
                 gene_hetero[pop] = -1.0; // nothing called
                 continue;
             }
-            double total = 0;
-            uint  called = 0;
+            double het_sum = 0;
+            double total   = hets_vec.size();
 
             for (uint i = 0; i < hets_vec.size(); i++){
-                if (hets_vec[i] == -1.0){
-                    continue; // missing
-                }
-                total += hets_vec[i];
-                called++;
+                het_sum += hets_vec[i];
             }
-            gene_hetero[pop] = called == 0 ? -1 : total / (double)called;
+            gene_hetero[pop] = het_sum / total;
         }
 
         return gene_hetero;
@@ -185,6 +162,43 @@ bool
 file_exists(const string &path){
     struct stat buffer;
     return stat(path.c_str(), &buffer) == 0;
+}
+
+bool
+is_compressed(const string &path){
+    if (path.size() < 4){
+        return false; // checking for .gz extension
+    }
+    uint idx = path.size() - 1;
+    return path[idx - 2] == '.' && path[idx - 1] == 'g' && path[idx] == 'z'; 
+}
+
+void 
+open_in_filestream(bool gzipped, gzFile &gz_fh, ifstream &fh, const string &infile){
+
+    bool bad;
+    if (gzipped){
+        gz_fh = gzopen(infile.c_str(), "rb");
+        bad   = gz_fh == NULL;
+    }
+    else {
+        fh.open(infile);
+        bad = !fh.is_open();
+    }
+    if (bad){
+        cerr << "Error: could not open " << infile << '\n';
+        exit(1);
+    }
+}
+
+void 
+close_in_filestream(bool gzipped, gzFile &gz_fh, ifstream &fh){
+    if (gzipped){
+        gzclose(gz_fh);
+    }
+    else {
+        fh.close();
+    }
 }
 
 string
@@ -300,12 +314,11 @@ parse_annotation(const string &ann, unordered_map<string, vector<Gene*>> &genome
     // collect all the genes and population the genome
     //
 
-    gzFile fh = gzopen(ann.c_str(), "rb");
+    bool gzipped = is_compressed(ann);
+    gzFile gz_fh = NULL;
+    ifstream txt_fh;
 
-    if (fh == NULL){
-        cerr << "Error: could not open " << ann << '\n';
-        exit(1);
-    }
+    open_in_filestream(gzipped, gz_fh, txt_fh, ann);
 
     //
     // we will create a mapping
@@ -327,8 +340,17 @@ parse_annotation(const string &ann, unordered_map<string, vector<Gene*>> &genome
     bool eof;
 
     while (true){
-        line = get_gzline(fh, eof);
-
+        if (gzipped){
+            line = get_gzline(gz_fh, eof);
+            if (eof){
+                break; // end of parsing
+            } 
+        }
+        else {
+            if (!getline(txt_fh, line)){
+                break; // end of parsing
+            }
+        }
         if (eof){
             break; // end of file
         }
@@ -361,7 +383,7 @@ parse_annotation(const string &ann, unordered_map<string, vector<Gene*>> &genome
         } // end of exon parsing
     } // end of parsing
 
-    gzclose(fh);
+    close_in_filestream(gzipped, gz_fh, txt_fh);
 
     if (gene_map.empty()){
         cerr << "No genes were found in " << ann << '\n';
@@ -394,46 +416,64 @@ parse_annotation(const string &ann, unordered_map<string, vector<Gene*>> &genome
     return 0;
 }
 
-int
-create_popmap(const string &popmap_file, unordered_map<string, string> &popmap){
-    //
-    // read a simple tsv of the population map to assign individuals to
-    //
-    fstream fh(popmap_file);
+double
+calc_percent_hetero(string &counts){
 
-    if (!fh.is_open()){
-        cerr << "Error: Unable to open " << popmap_file << '\n';
-        exit(1);
+    //
+    // parse a '/' delimited string
+    //
+
+    int homo_ref = 0;
+    int hetero   = 0;
+    int homo_alt = 0;
+    int start    = 0;
+    int end      = 0;
+    int cnt      = 0;
+    int tot      = 0;
+    int val;
+
+    while (end < counts.size()){
+        if (counts[end] == '/'){
+            val = stoi(counts.substr(start, end - start));
+            cnt++;
+            
+            switch (cnt)
+                {
+                case 1:
+                    homo_ref = val;
+                    break;
+                case 2:
+                    hetero = val;
+                    break;
+                case 3:
+                    homo_alt = val; // should not happen
+                    break;
+                default:
+                    break;
+                }
+            start = end + 1;
+        }
+        end++;
     }
 
-    vector<string> parts, seen;
-    string pop, sample, line;
-    while (std::getline(fh, line)){
-        if (line.empty() || line[0] == '#'){
-            continue;
-        }
-        if (line.back() == '\n'){
-            line.pop_back();
-        }
-        parse_tabular(line, parts);
-        if (parts.size() != 2){
-            cerr << "Error: Unexpected line in population map: " << popmap_file << '\n';
-            cerr << line << '\n';
+    if (start < counts.size()){
+        val = stoi(counts.substr(start, end - start));
+        if (cnt != 2){
+            cerr << "Invalid entry found: " << counts << '\n';
             exit(1);
         }
-        pop            = parts[0];
-        sample         = parts[1];
-        popmap[sample] = pop;
-        if (find(seen.begin(), seen.end(), pop) == seen.end()){
-            seen.push_back(pop);
-        }
+        homo_alt = val;
     }
 
-    fh.close();
+    tot = homo_ref + homo_alt + hetero;
 
-    cerr << "Loaded " << popmap.size() << " samples across " << seen.size() << " populations\n";
+    // no genotype information for this population
+    if (tot == 0){
+        return -1.0;
+    }
 
-    return 0;
+    return hetero / tot;
+
 }
 
 void
@@ -460,74 +500,68 @@ get_overlapping_genes(const int middle, const int site, vector<Gene*> *genes, ve
 }
 
 int
-parse_vcf(const string &vcf, unordered_map<string, string> &popmap,
-          unordered_map<string, vector<Gene*>> &genome){
-
-    gzFile fh = gzopen(vcf.c_str(), "rb");
-    if (fh == NULL){
-        cerr << "Error: could not open " << vcf << '\n';
-        exit(1);
-    }
+parse_table(const string &table, unordered_map<string, vector<Gene*>> &genome,
+            vector<string> &pops){
 
     //
-    // population -> sample_idx, sample_idx
-    // where sample_idx is the column index
-    // for that sample's genotype in the vcf
+    // find snps that are overlapping genes & add each populations
+    // score to each gene
     //
-    unordered_map<string, vector<uint>> pop_indices;
+
+    bool gzipped = is_compressed(table);
+    gzFile gz_fh = NULL;
+    ifstream txt_fh;
+
+    open_in_filestream(gzipped, gz_fh, txt_fh, table);
+
 
     vector<string> parts;
     vector<Gene*> *genes;
     vector<uint> gene_ends; // to handle long genes
     Gene *gene;
-    string line, sample, pop, chrom, curChrom;
+    string line, counts, pop, chrom, curChrom;
     bool   eof;
 
     //
-    // calculate heterozygosity at every exonic
-    // site for each population
+    // counters to find the column &
+    // number of variant sites within exons
     //
-    long overlapping = 0;
+    long overlapping = 0, line_num = 0;
 
     while (true){
-        line = get_gzline(fh, eof);
+        if (gzipped){
+            line = get_gzline(gz_fh, eof);
+            if (eof){
+                break; // end of parsing
+            } 
+        }
+        else {
+            if (!getline(txt_fh, line)){
+                break; // end of parsing
+            }
+        }
 
         if (eof){
-            break;
+            break; // end of file
         }
-
-        if (line[0] == '#'){
-            //
-            // we may need to collect the sample indices
-            // check for column starting with #CHROM 
-            //
-            if (line.size() > 6 && line.substr(0, 6) == "#CHROM"){
-                if (line.back() == '\n'){
-                    line.pop_back(); // we need to parse this file
-                    parse_tabular(line, parts);
-                    if (parts.size() < 10){
-                        // there is no genotype info here
-                        cerr << "No sample information found in " << vcf << '\n';
-                        exit(1);
-                    }
-                    // now parse through
-                    for (uint i = 9; i < parts.size(); i++){
-                        sample = parts[i];
-                        //
-                        // this may cause problems
-                        // in the future, it is not flexible
-                        //
-                        pop = popmap[sample];
-                        pop_indices[pop].push_back(i);
-                    }
-                }
-            }
-            continue;
-        }
+        line_num++;
 
         // remove last line character
         while (!line.empty() && (line.back() == '\n' || line.back() == '\r')){
             line.pop_back();
+        }
+
+        parse_tabular(line, parts);
+
+        if (line_num == 1 && parts.size() > 2 && parts.front() == "Chr"){
+            for (uint i = 2; i < parts.size(); i++){
+                pops.emplace_back(parts[i]);
+            }
+            continue;
+        }
+        else {
+            cerr << "Expected header: Chr\tPos\tPop1\tPop2.. in " << table << '\n';
+            exit(1);
         }
 
         if (line.empty()){
@@ -590,26 +624,24 @@ parse_vcf(const string &vcf, unordered_map<string, string> &popmap,
 
             // now we need to supply each gene
             // with the genotypes for each population
-            for (auto itr = pop_indices.begin(); itr != pop_indices.end(); itr++){
-                pop                   = itr->first;
-                vector<uint> &indices = itr->second;
-                vector<string> genos;
-                for (uint i = 0; i < indices.size(); i++){
-                    string geno = parts[indices[i]];
-                    geno        = geno.substr(0, geno.find(':')); 
-                    if (geno.find('.') == string::npos){ // skip missing data?
-                        genos.push_back(geno);
-                    }
+            double percnt;
+            for (uint i = 2; i < parts.size(); i++){
+                pop    = pops[i - 2];
+                counts = parts[i];
+                percnt = calc_percent_hetero(counts);
+
+                if (percnt == -1){
+                    continue; // no genotype info
                 }
-                for (uint i = 0 ; i < within_range.size(); i++){
-                    within_range[i]->add_pop_genos(site, pop, genos);
+                for (uint j = 0; j < within_range.size(); j++){
+                    within_range[j]->add_pop_genos(site, pop, percnt);
                 }
-            }
+            }   
 
         }
     } // end of file parsing
 
-    gzclose(fh);
+    close_in_filestream(gzipped, gz_fh, txt_fh);
 
     cerr << "Found a total of " << overlapping << " sites overlapping one or more genes\n";
 
@@ -617,7 +649,7 @@ parse_vcf(const string &vcf, unordered_map<string, string> &popmap,
 }
 
 int
-write_output(unordered_map<string, vector<Gene *>> &genome, unordered_map<string, string> &popmap){
+write_output(unordered_map<string, vector<Gene *>> &genome, vector<string> &pops){
     //
     // write a tsv where each
     // population will have its estimated
@@ -626,19 +658,6 @@ write_output(unordered_map<string, vector<Gene *>> &genome, unordered_map<string
 
     unordered_map<string, double> gene_hetero;
 
-    // create a header
-    vector<string> pops;
-    for (auto jtr = popmap.begin(); jtr != popmap.end(); jtr++){
-        if (find(pops.begin(), pops.end(), jtr->second) == pops.end()){
-            pops.push_back(jtr->second);
-        }
-    }
-
-    //
-    // ensure consistency
-    //
-    sort(pops.begin(), pops.end());
-    
     ofstream fh;
     fh.open("Gene.Heterozygosity.tsv");
 
@@ -680,56 +699,44 @@ write_output(unordered_map<string, vector<Gene *>> &genome, unordered_map<string
 
 void
 help(){
-    cerr << "Usage: ./calc_exonic_hetero -v vcf.gz -a annotation.gtf.gz -p popmap.tsv\n";
+    cerr << "Usage: ./calc_exonic_hetero -t merged_hwe.tsv.gz -a ann.gtf.gz\n";
     exit(1);
 }
 
 int main(int argc, char *argv[]){
 
-    string vcf, ann, popmap_file;
+    string table, ann;
     
-    // expect at least 3 inputs
-    if (argc < 4){
+    // expect at least 2 inputs
+    if (argc < 3){
         help();
     }
 
     for (int i = 1; i < argc; i++){
         string arg = argv[i];
-        if (arg == "-v" && i + 1 < argc){
-            vcf = string(argv[i + 1]);
+        if (arg == "-t" && i + 1 < argc){
+            table = string(argv[i + 1]);
         }
-        else if (arg == "-a" && i + 1 < argc){
+        if (arg == "-a" && i + 1 < argc){
             ann = string(argv[i + 1]);
-        }
-        else if (arg == "-p" && i + 1 < argc){
-            popmap_file = string(argv[i + 1]);
         }
         else if (arg == "-h"){
             help();
         }
     }
-    if (vcf.empty() && ann.empty() && popmap_file.empty()){
+
+    if (table.empty() || ann.empty()){
         help();
     }
 
-    if (!file_exists(vcf)){
-        cerr << "Unable to find " << vcf << '\n';
+    if (!file_exists(table)){
+        cerr << "Unable to find " << table << '\n';
         exit(1);
     }
     if (!file_exists(ann)){
         cerr << "Unable to find " << ann << '\n';
         exit(1);
     }
-    if (!file_exists(popmap_file)){
-        cerr << "Unable to find " << popmap_file << '\n';
-        exit(1);
-    }
-
-    //
-    // create the popmap
-    //
-    unordered_map<string, string> popmap;
-    create_popmap(popmap_file, popmap);
 
     //
     // load the genes
@@ -737,11 +744,12 @@ int main(int argc, char *argv[]){
     unordered_map<string, vector<Gene*>> genome;
     parse_annotation(ann, genome);
 
-    // parse the vcf file
-    parse_vcf(vcf, popmap, genome);
+    // parse the table
+    vector<string> pops;
+    parse_table(table, genome, pops);
 
     // write the output
-    write_output(genome, popmap);
+    write_output(genome, pops);
 
     return 0;
 }
