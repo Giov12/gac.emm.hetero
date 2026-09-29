@@ -130,6 +130,79 @@ public:
 
     }
 
+    void merge_exons(void){
+        
+        //
+        // create a single Transcript that will
+        // encompass all of this gene's exons
+        //
+
+        // nothing to do hear
+        if (this->_transcripts.empty()){
+            return;
+        }
+
+        vector<Exon> _all_exons;
+        string tname;
+
+        for (auto itr = this->_transcripts.begin(); itr != this->_transcripts.end(); itr++){
+            tname               = itr->first; // keep just in case
+            vector<Exon> &exons = itr->second.exons;
+            for (uint i = 0; i < exons.size(); i++){
+                _all_exons.push_back(exons[i]);
+            }
+            exons.clear();
+        }
+
+        //
+        // sort to then just go exon by exon
+        //
+        sort(_all_exons.begin(), _all_exons.end(), []
+            (const Exon &exon1, const Exon &exon2){
+                if (exon1.start == exon2.start){
+                    return exon1.end < exon2.end;
+                }
+                return exon1.start < exon2.start;
+            }
+        );
+
+        vector<Exon> resolved;
+        resolved.reserve(_all_exons.size());
+
+        resolved.push_back(_all_exons.front());
+        int i = 1, count = _all_exons.size();
+
+        while (i < count){
+            Exon &prev = resolved.back();
+            Exon &next = _all_exons[i];
+
+            // is there overlap?
+            if (next.start <= prev.end){
+                if (next.end > prev.end){ // merge if true
+                    prev.end = next.end;
+                }
+            }
+            else {
+                resolved.push_back(next);
+            }
+            i++;
+        }
+        
+        // clear up transcript map
+        string name = this->_transcripts.size() == 1 ? tname : "merged_transcripts";
+        Transcript t;
+        t.id    = name;
+        t.exons = resolved;
+        
+        for (uint i = 0; i < resolved.size(); i++){
+            t.length += resolved[i].end - resolved[i].start + 1;
+        }
+
+        this->_transcripts.clear();
+        this->_transcripts[name] = t;
+
+    }
+
     vector<Transcript*> calc_fst(void){
         //
         // return the average fst for each transcripts
@@ -308,7 +381,7 @@ parse_attributes(string &attributes, vector<Attribute> &atrbVec){
 
 int
 parse_annotation(const string &ann, unordered_map<string, vector<Gene*>> &genome, 
-    const unordered_map<string, vector<SNP>> &markers){
+    const unordered_map<string, vector<SNP>> &markers, const bool merge_exons){
     //
     // collect only genes on chromosomes with markers
     //
@@ -434,7 +507,13 @@ parse_annotation(const string &ann, unordered_map<string, vector<Gene*>> &genome
 
         chrom_genes.reserve(genes.size()); // reserve enough space
         for (auto jtr = genes.begin(); jtr != genes.end(); jtr++){
-            jtr->second->sort_exons(); // sort exons for each transcript
+            if (!merge_exons){
+                jtr->second->sort_exons(); // sort exons for each transcript
+            }
+            else {
+                jtr->second->merge_exons(); // collapse gene to a single set of exons
+            }
+            
             chrom_genes.push_back(jtr->second);
         }
 
@@ -624,16 +703,17 @@ overlap_genes(unordered_map<string, vector<Gene*>> &genome,
 }
 
 int
-write_output(unordered_map<string, vector<Gene *>> &genome){
+write_output(unordered_map<string, vector<Gene *>> &genome, bool const merge_exons){
     //
     // write a tsv where each
     // 
     //
 
     string gene_id, gene_name;
+    string outname = merge_exons ? "Avg_gene_fsts.tsv" : "Avg_gene_fsts_per_transcripts.tsv";
 
     ofstream fh;
-    fh.open("Avg_gene_fsts.tsv");
+    fh.open(outname);
 
     fh << "#GeneID\tGeneName\tTranscriptID\tNumSNPS\tAvgFst\n";
 
@@ -668,13 +748,14 @@ write_output(unordered_map<string, vector<Gene *>> &genome){
 
 void
 help(){
-    cerr << "Usage: ./calc_gene_fst -t fst_table.tsv.gz -a ann.gtf.gz\n";
+    cerr << "Usage: ./calc_gene_fst -t fst_table.tsv.gz -a ann.gtf.gz --merge [optional]\n";
     exit(1);
 }
 
 int main(int argc, char *argv[]){
 
     string table, ann;
+    bool merge_exons = false;
     
     // expect at least 2 inputs
     if (argc < 3){
@@ -688,6 +769,9 @@ int main(int argc, char *argv[]){
         }
         if (arg == "-a" && i + 1 < argc){
             ann = string(argv[i + 1]);
+        }
+        else if (arg == "--merge"){
+            merge_exons = true;
         }
         else if (arg == "-h"){
             help();
@@ -718,7 +802,7 @@ int main(int argc, char *argv[]){
     // with markers
     //
     unordered_map<string, vector<Gene*>> genome;
-    parse_annotation(ann, genome, markers);
+    parse_annotation(ann, genome, markers, merge_exons);
 
     //
     // now overlap the two datasets
@@ -726,7 +810,7 @@ int main(int argc, char *argv[]){
     overlap_genes(genome, markers);
 
     // write the output
-    write_output(genome);
+    write_output(genome, merge_exons);
 
     return 0;
 }
