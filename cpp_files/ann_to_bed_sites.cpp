@@ -38,6 +38,8 @@ struct Attribute {
 };
 
 class Gene {
+private:
+    bool _coding = false;
 
 public:
     string       id;
@@ -133,6 +135,14 @@ public:
 
         // no overlap
         return false;
+    }
+
+    void set_as_coding(void){
+        this->_coding = true;
+    }
+
+    bool coding(void) const {
+        return this->_coding;
     }
  
 };
@@ -287,11 +297,13 @@ parse_attributes(string &attributes, vector<Attribute> &atrbVec){
 }
 
 int
-make_bed(const string &ann, unordered_map<string, vector<Gene*>> &genome){
+make_bed(const string &ann, unordered_map<string, vector<Gene*>> &genome, const bool coding){
 
     //
     // collect all the genes and also create the bed file in parallel
     //
+
+    cerr << "Parsing " << ann << '\n';
 
     bool gzipped = is_compressed(ann);
     gzFile gz_fh = NULL;
@@ -353,7 +365,7 @@ make_bed(const string &ann, unordered_map<string, vector<Gene*>> &genome){
 
         chrom = parts[0];
 
-        if (parts[2] == "gene" || parts[2] == "exon"){
+        if (parts[2] == "gene" || parts[2] == "exon" || parts[2] == "CDS"){
 
             if (parts[8].back() == '\n'){
                 parts[8].pop_back(); // strip new line char
@@ -380,18 +392,18 @@ make_bed(const string &ann, unordered_map<string, vector<Gene*>> &genome){
             if (parts[2] == "gene"){
                 g = new Gene(gene_id, gene_name, start, end);
                 gene_map[chrom][gene_id] = g;
-                
-                // write the bed file
-                string outname = gene_id + '_' + (gene_name.empty() ? gene_id : gene_name);
-                ofh << chrom << '\t' << start - 1 << '\t' << end << '\t' << outname << '\n';
-                written++;
             }
             else if (gene_map[chrom].find(gene_id) != gene_map[chrom].end()) {
-                Exon exon{start, end};
-                gene_map[chrom][gene_id]->add_exon(exon);
+                if (parts[2] == "exon"){
+                    Exon exon{start, end};
+                    gene_map[chrom][gene_id]->add_exon(exon);
+                }
+                else{
+                    gene_map[chrom][gene_id]->set_as_coding();
+                }
             }
             else {
-                cerr << "Malformed annotations. Exon came before gene entry. "
+                cerr << "Malformed annotations. Exon/CDS came before gene entry. "
                      << "Offending line:\n" << line;
                 exit(1);
             }
@@ -413,8 +425,20 @@ make_bed(const string &ann, unordered_map<string, vector<Gene*>> &genome){
 
         chrom_genes.reserve(genes.size()); // reserve enough space
         for (auto jtr = genes.begin(); jtr != genes.end(); jtr++){
-            jtr->second->resolve_exons(); // deduplicate & merge overlapping exons
-            chrom_genes.push_back(std::move(jtr->second));
+            Gene *gene = jtr->second;
+            if (coding && !gene->coding()){
+                continue; // analysis restricted to protein-coding genes
+            }
+
+            // deduplicate & merge overlapping exons
+            gene->resolve_exons(); 
+
+            // write the bed file
+            string outname = gene->id + '_' +  (gene->name.empty() ? gene->id : gene->name);
+            ofh << chrom << '\t' << gene->start - 1 << '\t' << gene->end << '\t' << outname << '\n';
+            written++;
+
+            chrom_genes.push_back(gene);
         }
 
         // now sort for downstream binary search
@@ -519,6 +543,10 @@ make_sites(const string &vcf, unordered_map<string, vector<Gene*>> &genome){
             }
         }
 
+        if (ngenes == 0){
+            continue; // no genes in this chrom
+        }
+
         // now check if this gene lands in any exonic gene
         uint left = 0, mid, right = ngenes;
         while (left < right){
@@ -572,14 +600,15 @@ make_sites(const string &vcf, unordered_map<string, vector<Gene*>> &genome){
 
 void
 help(){
-    cerr << "Usage: ./ann_to_bed_sites -v vcf.gz -a ann.gtf.gz\n";
+    cerr << "Usage: ./ann_to_bed_sites -v vcf.gz -a ann.gtf.gz --coding [optional]\n";
     exit(1);
 }
 
 int main(int argc, char *argv[]){
 
     string vcf, ann, arg;
-    
+    bool coding = false;
+
     // expect at least two arguments
     if (argc < 5){
         help();
@@ -592,6 +621,9 @@ int main(int argc, char *argv[]){
         }
         else if (arg == "-a" && i + 1 < argc){
             ann = string(argv[i + 1]);
+        }
+        else if (arg == "--coding"){
+            coding = true;
         }
         else if (arg == "-h"){
             help();
@@ -612,7 +644,7 @@ int main(int argc, char *argv[]){
 
     // first, collect the genes
     unordered_map<string, vector<Gene*>> genome;
-    make_bed(ann, genome);
+    make_bed(ann, genome, coding);
 
     // now find which snps land on exons
     make_sites(vcf, genome);

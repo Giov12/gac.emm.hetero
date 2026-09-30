@@ -318,13 +318,29 @@ write_output(vector<Gene> &genes){
 }
 
 uint
-create_uint(const char *arg){
+create_uint(const char *arg, const uint n){
 
     // if possible, create a number out of this
     // char array
 
+    string param;
+    switch (n)
+    {
+    case 0:
+        param = "--boostraps";
+        break;
+    case 1:
+        param = "--threads";
+        break;
+    case 2:
+        param = "--seed";
+        break;
+    default:
+        break;
+    }
+
     if (arg == nullptr || *arg == '\0'){
-        cerr << "Empty input provided for either --bootstraps, --threads, or --seed\n";
+        cerr << "Empty input provided for " << param << '\n';
         exit(1);
     }
 
@@ -333,7 +349,7 @@ create_uint(const char *arg){
     auto result     = std::from_chars(arg, end, val, 10);
 
     if (result.ec != std::errc() || result.ptr != end){
-        cerr << arg << " is not a valid --bootstraps value\n";
+        cerr << arg << " is not a valid " << param << " value\n";
         exit(1);
     }
 
@@ -368,13 +384,13 @@ int main(int argc, char *argv[]){
             transcript_level = true;
         }
         else if (arg == "--bootstraps" && i + 1 < argc){
-            bootstraps = create_uint(argv[i + 1]);
+            bootstraps = create_uint(argv[i + 1], 0);
         }
         else if (arg == "--threads" && i + 1 < argc){
-            threads = create_uint(argv[i + 1]);
+            threads = create_uint(argv[i + 1], 1);
         }
         else if (arg == "--seed" && i + 1 < argc){
-            seed = create_uint(argv[i + 1]);
+            seed = create_uint(argv[i + 1], 2);
         }
         else if (arg == "-h"){
             help();
