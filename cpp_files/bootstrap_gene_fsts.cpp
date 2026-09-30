@@ -26,7 +26,6 @@ using std::mt19937_64;
 using std::uniform_int_distribution;
 using std::lower_bound;
 
-
 //
 // code to parse the results of calc_gene_fst that will
 // bootstrap the Fst scores and return a p-value
@@ -182,7 +181,6 @@ load_genes(const string &infile, vector<Gene> &genes, const bool transcript_leve
             continue; // skip header
         }
 
-
         // remove last line character
         while (!line.empty() && (line.back() == '\n' || line.back() == '\r')){
             line.pop_back();
@@ -290,7 +288,6 @@ boostrap(vector<Gene> &genes, const uint boostraps, const uint threads, const ui
     return 0;
 
 }
-
 
 int
 write_output(vector<Gene> &genes){
