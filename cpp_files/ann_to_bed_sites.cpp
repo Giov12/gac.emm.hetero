@@ -595,6 +595,19 @@ make_sites(const string &vcf, unordered_map<string, vector<Gene*>> &genome){
     return 0;
 }
 
+int
+clear_genes(unordered_map<string, vector<Gene*>> &genome){
+    // helper function to clear the gene objects
+
+    for (auto itr = genome.begin(); itr != genome.end(); itr++){
+        vector<Gene*> &genes = itr->second;
+        for (uint i = 0; i < genes.size(); i++){
+            delete genes[i];
+        }
+    }
+    return 0;
+}
+
 void
 help(){
     cerr << "Usage: ./ann_to_bed_sites -v vcf.gz -a ann.gtf.gz --coding [optional]\n";
@@ -645,6 +658,9 @@ int main(int argc, char *argv[]){
 
     // now find which snps land on exons
     make_sites(vcf, genome);
+
+    // clean up
+    clear_genes(genome);
 
     return 0;
 }
