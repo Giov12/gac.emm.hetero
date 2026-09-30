@@ -53,9 +53,6 @@ public:
     uint         end;
     vector<Exon> exons;
 
-    //
-    // empty constructor
-    //
     Gene (string id_, string name, uint start, uint end){
         this->id    = id_;
         this->name  = name;

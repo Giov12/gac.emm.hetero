@@ -59,9 +59,6 @@ public:
     uint   start;
     uint   end;
 
-    //
-    // empty constructor
-    //
     Gene (string id_, string name, uint start, uint end){
         this->id    = id_;
         this->name  = name;

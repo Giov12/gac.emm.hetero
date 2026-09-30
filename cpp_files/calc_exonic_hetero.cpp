@@ -36,9 +36,6 @@ public:
     vector<Exon> exons;
     unordered_map<string, vector<double>> sites;
 
-    //
-    // empty constructor
-    //
     Gene (string id_, uint start, uint end){
         this->id    = id_;
         this->start = start;
