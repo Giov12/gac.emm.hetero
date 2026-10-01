@@ -4,11 +4,13 @@
 #include <string>
 #include <charconv>
 #include <cstring>
+#include <cstdint>
+#include <iomanip>
 #include <algorithm>
 #include <vector>
 #include <zlib.h>
 #include <random>
-#include <omp.h>
+#include <omp.h> // requires -fopenmp
 
 using std::string;
 using std::ofstream;
@@ -17,7 +19,6 @@ using std::vector;
 using std::cerr;
 using std::cout;
 using std::stoi;
-using std::stof;
 using std::stod;
 using std::sort;
 using std::setprecision;
@@ -27,8 +28,8 @@ using std::uniform_int_distribution;
 using std::lower_bound;
 
 //
-// code to parse the results of calc_gene_fst that will
-// bootstrap the Fst scores and return a p-value
+// code to parse the results of calc_gene_avg_pixy that will
+// bootstrap the scores and return a p-value
 // of whether the value is significant based on how
 // often it was sampled across replicates
 //
@@ -37,8 +38,8 @@ typedef unsigned int uint;
 
 struct Gene {
     string id;
-    float fst;
-    float pval;
+    double score;
+    double pval;
 };
 
 bool
@@ -141,7 +142,7 @@ parse_tabular(string &line, vector<string> &parts){
 }
 
 int
-load_genes(const string &infile, vector<Gene> &genes, const bool transcript_level){
+load_genes(const string &infile, vector<Gene> &genes, const bool transcript_level, const bool skip_nodata){
 
     //
     // find snps that are overlapping genes & add each populations
@@ -154,10 +155,9 @@ load_genes(const string &infile, vector<Gene> &genes, const bool transcript_leve
 
     open_in_filestream(gzipped, gz_fh, txt_fh, infile);
 
-
     vector<string> parts;
     string line, gene;
-    float fst;
+    double score;
     const uint column = transcript_level ? 2 : 1;
     bool eof      = false;
     uint line_num = 0;
@@ -196,9 +196,17 @@ load_genes(const string &infile, vector<Gene> &genes, const bool transcript_leve
             cerr << "Error: Malformed line found:\n" << line << '\n';
             exit(1);
         }
-        gene = parts[column];
-        fst  = stof(parts[4]);
-        genes.push_back({gene, fst, 1.0}); // set p-value to 1.0 as default
+
+        if (skip_nodata){
+            // only collect genes with an observation
+            uint count = stoi(parts[3]);
+            if (count == 0){
+                continue;
+            }
+        }
+        gene  = parts[column];
+        score = stod(parts[4]);
+        genes.push_back({gene, score, 1.0}); // set p-value to 1.0 as default
 
     } // end of file parsing
 
@@ -215,25 +223,26 @@ load_genes(const string &infile, vector<Gene> &genes, const bool transcript_leve
 }
 
 int
-boostrap(vector<Gene> &genes, const uint boostraps, const uint threads, const uint seed){
+bootstrap(vector<Gene> &genes, const uint bootstraps, const uint threads, const uint seed){
 
     //
     // function that will actually compute the bootstrap replicates in parallel
     //
 
     const uint ngenes = genes.size();
+    uint rounds       = 0;
 
-    // sort the fst values
-    vector<float> sorted_fsts(ngenes);
+    // sort the values
+    vector<double> sorted_scores(ngenes);
 
     for (uint i = 0; i < ngenes; i++){
-        sorted_fsts[i] = genes[i].fst;
+        sorted_scores[i] = genes[i].score;
     }
 
-    sort(sorted_fsts.begin(), sorted_fsts.end());
+    sort(sorted_scores.begin(), sorted_scores.end());
 
     //
-    // how often a fst in sorted_fsts[i] was seen
+    // how often a score in sorted_scores[i] was seen
     // across replicates
     //
     vector<uint> counts(ngenes, 0);
@@ -244,19 +253,28 @@ boostrap(vector<Gene> &genes, const uint boostraps, const uint threads, const ui
         vector<uint> local_counts(ngenes, 0);
 
         #pragma omp for schedule(static)
-        for (uint b = 0; b < boostraps; b++){
+        for (uint b = 0; b < bootstraps; b++){
             // set the seed
             seed_seq ss{seed, b};
 
             // create the random generator
             mt19937_64 rng(ss);
 
-            // create a random sampler by sampling the positions of each fst
+            // create a random sampler by sampling the positions of each score
             uniform_int_distribution<uint> pick(0, ngenes - 1);
 
             // increment the counts
             for (uint p = 0; p < ngenes; p++){
                 local_counts[pick(rng)]++;
+            }
+
+            uint finished;
+            #pragma omp atomic capture
+            finished = ++rounds;
+
+            if (finished % 1000 == 0){
+                #pragma omp critical(log)
+                cerr << "Finished round " << finished << '\n';
             }
         }
         #pragma omp critical
@@ -269,32 +287,31 @@ boostrap(vector<Gene> &genes, const uint boostraps, const uint threads, const ui
 
     //
     // start counting backwards
-    // idea: how many fst values drawn at random
-    // are greater than the fst value at position i
+    // idea: how many score values drawn at random
+    // are greater than the score value at position i
     //
     vector<uint64_t> ranks(ngenes + 1, 0);
     for (uint i = ngenes; i-- > 0;){ // ensure we do not hit ngenes + 1
         ranks[i] = ranks[i + 1] + counts[i];
     }
 
-    const double total = (double)boostraps * (double)ngenes;
+    const double total = (double)bootstraps * (double)ngenes;
 
     // now assign the p-values
-    for (uint i = 0; i < ngenes; i++){ // binary search to find the first position (iterator) that is > than genes[i].fst
-        uint j        = lower_bound(sorted_fsts.begin(), sorted_fsts.end(), genes[i].fst) - sorted_fsts.begin();
-        genes[i].pval = (float)((ranks[j] + 1.0)/( total + 1.0)); // add 1.0 to prevent things ever being zero
+    for (uint i = 0; i < ngenes; i++){ // binary search to find the first position (iterator) that is > than genes[i].score
+        uint j        = lower_bound(sorted_scores.begin(), sorted_scores.end(), genes[i].score) - sorted_scores.begin();
+        genes[i].pval = (double)((ranks[j] + 1.0)/( total + 1.0)); // add 1.0 to prevent things ever being zero
     }
 
     return 0;
-
 }
 
 int
 write_output(vector<Gene> &genes){
  
     //
-    // write a simple 2-column tsv
-    // where gene ID -> pvalue
+    // write a simple 3-column tsv
+    // where gene ID, score, pvalue
     //
 
     string outname = "Gene_pvalues.tsv";
@@ -305,11 +322,11 @@ write_output(vector<Gene> &genes){
         exit(1);
     }
 
-    fh << "#Gene\tpvalue\n";
+    fh << "#Gene\tValue\tpvalue\n";
     fh << setprecision(6);
 
     for (uint i = 0; i < genes.size(); i++){
-        fh << genes[i].id << '\t' << genes[i].pval << '\n';
+        fh << genes[i].id << '\t' << genes[i].score << '\t' << genes[i].pval << '\n';
     }
 
     fh.close();
@@ -327,7 +344,7 @@ create_uint(const char *arg, const uint n){
     switch (n)
     {
     case 0:
-        param = "--boostraps";
+        param = "--bootstraps";
         break;
     case 1:
         param = "--threads";
@@ -358,7 +375,7 @@ create_uint(const char *arg, const uint n){
 
 void
 help(){
-    cerr << "Usage: ./bootstrap_gene_fsts -f Avg_gene_fsts.tsv --bootstraps INT [default: 10000] --threads INT [default 1] --seed INT [default 1234] --transcripts [optional]\n";
+    cerr << "Usage: ./bootstrap_gene_scores -f Avg_gene_scores.tsv --bootstraps INT [default: 10000] --threads INT [default 1] --seed INT [default 1234] --transcripts [optional] --skip_nodata [optional]\n";
     exit(1);
 }
 
@@ -369,6 +386,7 @@ int main(int argc, char *argv[]){
     uint threads          = 1;
     uint seed             = 1234;
     bool transcript_level = false;
+    bool skip_nodata      = false;
     
     // expect at least 2 inputs
     if (argc < 3){
@@ -382,6 +400,9 @@ int main(int argc, char *argv[]){
         }
         else if (arg == "--transcripts"){
             transcript_level = true;
+        }
+        else if (arg == "--skip_nodata"){
+            skip_nodata = true;
         }
         else if (arg == "--bootstraps" && i + 1 < argc){
             bootstraps = create_uint(argv[i + 1], 0);
@@ -415,20 +436,22 @@ int main(int argc, char *argv[]){
         cerr << "Threads must be at least 1\n";
         exit(1);
     }
+    else if (threads < (uint)omp_get_max_threads()){
+        cerr << "Warning: Max threads available is " << (uint)omp_get_max_threads() << '\n';
+        threads = (uint)omp_get_max_threads();
 
-    if (seed < 0){
-        cerr << "Seed cannot be negative\n";
-        exit(1);
     }
 
     // read in the data
     vector<Gene> genes;
-    load_genes(infile, genes, transcript_level);
+    load_genes(infile, genes, transcript_level, skip_nodata);
 
-    // next, count how often we see each fst
+    cerr << "Starting " << bootstraps << " bootstraps\n";
+
+    // next, count how often we see each score
     // value and rank it's frequency based on
-    // how many times we see fst scores higher than it
-    boostrap(genes, bootstraps, threads, seed);
+    // how many times we see other scores higher than it
+    bootstrap(genes, bootstraps, threads, seed);
 
     // write the output
     write_output(genes);
