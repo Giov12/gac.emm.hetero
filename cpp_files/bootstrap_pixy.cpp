@@ -243,6 +243,7 @@ parse_pixy(string &table, string &pop1, string &pop2, vector<Window> &windows, c
 
     if (windows.empty()){
         cerr << "Did not find any windows between " << pop1 << " and " << pop2 << '\n';
+        exit(1);
     }
 
     cerr << "Loaded " << windows.size() << " windows\n";
