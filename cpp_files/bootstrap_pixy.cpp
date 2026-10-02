@@ -402,7 +402,7 @@ create_uint(const char *arg, const uint n){
 
 void
 help(){
-    cerr << "Usage: ./bootstrap_pixy -f pixy_results.txt --bootstraps INT [default: 10000] --threads INT [default 1] --seed INT [default 1234] --skip_nodata [optional]\n";
+    cerr << "Usage: ./bootstrap_pixy -f pixy_results.txt --pop1 POP1 --pop2 POP2 --bootstraps INT [default: 10000] --threads INT [default 1] --seed INT [default 1234] --skip_nodata [optional]\n";
     exit(1);
 }
 
