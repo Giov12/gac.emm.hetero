@@ -28,7 +28,7 @@ using std::uniform_int_distribution;
 using std::lower_bound;
 
 //
-// code to parse the results of calc_gene_avg_pixy that will
+// code to parse the results of a table generated from pixy that will
 // bootstrap the scores and return a p-value
 // of whether the value is significant based on how
 // often it was sampled across replicates
@@ -36,7 +36,7 @@ using std::lower_bound;
 
 typedef unsigned int uint;
 
-struct Gene {
+struct Window {
     string id;
     double score;
     double pval;
@@ -141,26 +141,30 @@ parse_tabular(string &line, vector<string> &parts){
     return 0;
 }
 
-int
-load_genes(const string &infile, vector<Gene> &genes, const bool transcript_level, const bool skip_nodata){
+int 
+parse_pixy(string &table, string &pop1, string &pop2, vector<Window> &windows, const bool skip){
 
     //
-    // find snps that are overlapping genes & add each populations
-    // score to each gene
+    // parse the results of a pixy output file and load the windows
+    // for the population comparison of interest
     //
 
-    bool gzipped = is_compressed(infile);
+    bool gzipped = is_compressed(table);
     gzFile gz_fh = NULL;
     ifstream txt_fh;
 
-    open_in_filestream(gzipped, gz_fh, txt_fh, infile);
+    open_in_filestream(gzipped, gz_fh, txt_fh, table);
+
 
     vector<string> parts;
-    string line, gene;
-    double score;
-    const uint column = transcript_level ? 2 : 1;
-    bool eof      = false;
-    uint line_num = 0;
+    string line, chrom;
+    bool eof = false;
+
+    //
+    // counters to find the column &
+    // number of variant sites within exons
+    //
+    uint found = 0, line_num = 0;
 
     while (true){
         if (gzipped){
@@ -175,11 +179,10 @@ load_genes(const string &infile, vector<Gene> &genes, const bool transcript_leve
             }
         }
 
-        line_num++;
-
-        if (line_num == 1 && !line.empty() && line[0] == '#'){
-            continue; // skip header
+        if (eof){
+            break; // end of file
         }
+        line_num++;
 
         // remove last line character
         while (!line.empty() && (line.back() == '\n' || line.back() == '\r')){
@@ -192,51 +195,75 @@ load_genes(const string &infile, vector<Gene> &genes, const bool transcript_leve
 
         parse_tabular(line, parts);
 
-        if (parts.size() != 5){
-            cerr << "Error: Malformed line found:\n" << line << '\n';
+        if (line_num == 1){
+            if (parts[0] != "pop1"){
+                cerr << "Did not encounter a header starting with pop1 in " << table << '\n';
+                exit(1);
+            }
+            continue; // skip header
+        }
+
+        if (parts.size() < 7){
+            cerr << "Error: Expected at least 7 columns. Offending line: " << line << '\n';
             exit(1);
         }
 
-        if (skip_nodata){
-            // only collect genes with an observation
-            uint count = stoi(parts[3]);
-            if (count == 0){
+        // check that this is for the populations of interest
+        bool valid = false; 
+
+        if (parts[0] == pop1 && parts[1] == pop2){
+            valid = true;
+        }
+        else if (parts[0] == pop2 && parts[1] == pop1){
+            valid = true;
+        }
+
+        if (!valid){
+            continue;
+        }
+
+        chrom = parts[2];
+        Window window;
+        window.id = chrom + '_' + parts[3] + '_' + parts[4];
+
+        if (parts[5] == "NA" || parts[5][0] == '-'){
+            if (skip && parts[5] == "NA"){
                 continue;
             }
+            window.score = 0.0;
         }
-        gene  = parts[column];
-        score = stod(parts[4]);
-        genes.push_back({gene, score, 1.0}); // set p-value to 1.0 as default
-
-    } // end of file parsing
+        else {
+            window.score = stod(parts[5]);
+        }
+      
+        windows.push_back(window);
+    }
 
     close_in_filestream(gzipped, gz_fh, txt_fh);
 
-    if (genes.empty()){
-        cerr << "No genes loaded from " << infile << '\n';
-        exit(1);
+    if (windows.empty()){
+        cerr << "Did not find any windows between " << pop1 << " and " << pop2 << '\n';
     }
 
-    cerr << "Loaded " << genes.size() << " genes\n";
+    cerr << "Loaded " << windows.size() << " windows\n";
 
-    return 0;
+    return 0; 
 }
-
 int
-bootstrap(vector<Gene> &genes, const uint bootstraps, const uint threads, const uint seed){
+bootstrap(vector<Window> &windows, const uint bootstraps, const uint threads, const uint seed){
 
     //
     // function that will actually compute the bootstrap replicates in parallel
     //
 
-    const uint ngenes = genes.size();
+    const uint nwindows = windows.size();
     uint rounds       = 0;
 
     // sort the values
-    vector<double> sorted_scores(ngenes);
+    vector<double> sorted_scores(nwindows);
 
-    for (uint i = 0; i < ngenes; i++){
-        sorted_scores[i] = genes[i].score;
+    for (uint i = 0; i < nwindows; i++){
+        sorted_scores[i] = windows[i].score;
     }
 
     sort(sorted_scores.begin(), sorted_scores.end());
@@ -245,12 +272,12 @@ bootstrap(vector<Gene> &genes, const uint bootstraps, const uint threads, const 
     // how often a score in sorted_scores[i] was seen
     // across replicates
     //
-    vector<uint> counts(ngenes, 0);
+    vector<uint> counts(nwindows, 0);
 
     #pragma omp parallel num_threads(threads)
     {
 
-        vector<uint> local_counts(ngenes, 0);
+        vector<uint> local_counts(nwindows, 0);
 
         #pragma omp for schedule(static)
         for (uint b = 0; b < bootstraps; b++){
@@ -261,10 +288,10 @@ bootstrap(vector<Gene> &genes, const uint bootstraps, const uint threads, const 
             mt19937_64 rng(ss);
 
             // create a random sampler by sampling the positions of each score
-            uniform_int_distribution<uint> pick(0, ngenes - 1);
+            uniform_int_distribution<uint> pick(0, nwindows - 1);
 
             // increment the counts
-            for (uint p = 0; p < ngenes; p++){
+            for (uint p = 0; p < nwindows; p++){
                 local_counts[pick(rng)]++;
             }
 
@@ -279,7 +306,7 @@ bootstrap(vector<Gene> &genes, const uint bootstraps, const uint threads, const 
         }
         #pragma omp critical
         {
-            for (uint j = 0; j < ngenes; j++){
+            for (uint j = 0; j < nwindows; j++){
                 counts[j] += local_counts[j];
             }
         }
@@ -290,31 +317,31 @@ bootstrap(vector<Gene> &genes, const uint bootstraps, const uint threads, const 
     // idea: how many score values drawn at random
     // are greater than the score value at position i
     //
-    vector<uint64_t> ranks(ngenes + 1, 0);
-    for (uint i = ngenes; i-- > 0;){ // ensure we do not hit ngenes + 1
+    vector<uint64_t> ranks(nwindows + 1, 0);
+    for (uint i = nwindows; i-- > 0;){ // ensure we do not hit nwindows + 1
         ranks[i] = ranks[i + 1] + counts[i];
     }
 
-    const double total = (double)bootstraps * (double)ngenes;
+    const double total = (double)bootstraps * (double)nwindows;
 
     // now assign the p-values
-    for (uint i = 0; i < ngenes; i++){ // binary search to find the first position (iterator) that is > than genes[i].score
-        uint j        = lower_bound(sorted_scores.begin(), sorted_scores.end(), genes[i].score) - sorted_scores.begin();
-        genes[i].pval = (double)((ranks[j] + 1.0)/( total + 1.0)); // add 1.0 to prevent things ever being zero
+    for (uint i = 0; i < nwindows; i++){ // binary search to find the first position (iterator) that is >= than windows[i].score
+        uint j          = lower_bound(sorted_scores.begin(), sorted_scores.end(), windows[i].score) - sorted_scores.begin();
+        windows[i].pval = ((ranks[j] + 1.0)/( total + 1.0)); // add 1.0 to prevent things ever being zero
     }
 
     return 0;
 }
 
 int
-write_output(vector<Gene> &genes){
+write_output(vector<Window> &windows){
  
     //
     // write a simple 3-column tsv
-    // where gene ID, score, pvalue
+    // where window ID, score, pvalue
     //
 
-    string outname = "Gene_pvalues.tsv";
+    string outname = "Window_pvalues.tsv";
     ofstream fh(outname);
 
     if (!fh.is_open()){
@@ -322,11 +349,11 @@ write_output(vector<Gene> &genes){
         exit(1);
     }
 
-    fh << "#Gene\tValue\tpvalue\n";
+    fh << "#Window\tValue\tpvalue\n";
     fh << setprecision(6);
 
-    for (uint i = 0; i < genes.size(); i++){
-        fh << genes[i].id << '\t' << genes[i].score << '\t' << genes[i].pval << '\n';
+    for (uint i = 0; i < windows.size(); i++){
+        fh << windows[i].id << '\t' << windows[i].score << '\t' << windows[i].pval << '\n';
     }
 
     fh.close();
@@ -375,18 +402,17 @@ create_uint(const char *arg, const uint n){
 
 void
 help(){
-    cerr << "Usage: ./bootstrap_gene_scores -f Avg_gene_scores.tsv --bootstraps INT [default: 10000] --threads INT [default 1] --seed INT [default 1234] --transcripts [optional] --skip_nodata [optional]\n";
+    cerr << "Usage: ./bootstrap_pixy -f pixy_results.txt --bootstraps INT [default: 10000] --threads INT [default 1] --seed INT [default 1234] --skip_nodata [optional]\n";
     exit(1);
 }
 
 int main(int argc, char *argv[]){
 
-    string infile;
-    uint bootstraps       = 10000;
-    uint threads          = 1;
-    uint seed             = 1234;
-    bool transcript_level = false;
-    bool skip_nodata      = false;
+    string infile, pop1, pop2;
+    uint bootstraps  = 10000;
+    uint threads     = 1;
+    uint seed        = 1234;
+    bool skip_nodata = false;
     
     // expect at least 2 inputs
     if (argc < 3){
@@ -397,9 +423,6 @@ int main(int argc, char *argv[]){
         string arg = argv[i];
         if (arg == "-f" && i + 1 < argc){
             infile = argv[i + 1];
-        }
-        else if (arg == "--transcripts"){
-            transcript_level = true;
         }
         else if (arg == "--skip_nodata"){
             skip_nodata = true;
@@ -413,6 +436,12 @@ int main(int argc, char *argv[]){
         else if (arg == "--seed" && i + 1 < argc){
             seed = create_uint(argv[i + 1], 2);
         }
+        else if (arg == "--pop1" && i + 1 < argc){
+            pop1 = string(argv[i + 1]);
+        }
+        else if (arg == "--pop2" && i + 1 < argc){
+            pop2 = string(argv[i + 1]);
+        }
         else if (arg == "-h"){
             help();
         }
@@ -420,6 +449,16 @@ int main(int argc, char *argv[]){
 
     if (infile.empty()){
         help();
+    }
+
+    if (pop1.empty()){
+        cerr << "--pop1 is required\n";
+        exit(1);
+    }
+
+    if (pop2.empty()){
+        cerr << "--pop2 is required\n";
+        exit(1);
     }
 
     if (!file_exists(infile)){
@@ -437,24 +476,24 @@ int main(int argc, char *argv[]){
         exit(1);
     }
     else if (threads > (uint)omp_get_max_threads()){
-        cerr << "Warning: Max threads available is " << (uint)omp_get_max_threads() << '\n';
+        cerr << "Warning: Max threads available is " << omp_get_max_threads() << '\n';
         threads = (uint)omp_get_max_threads();
 
     }
 
     // read in the data
-    vector<Gene> genes;
-    load_genes(infile, genes, transcript_level, skip_nodata);
+    vector<Window> windows;
+    parse_pixy(infile, pop1, pop2, windows, skip_nodata);
 
     cerr << "Starting " << bootstraps << " bootstraps\n";
 
     // next, count how often we see each score
     // value and rank it's frequency based on
     // how many times we see other scores higher than it
-    bootstrap(genes, bootstraps, threads, seed);
+    bootstrap(windows, bootstraps, threads, seed);
 
     // write the output
-    write_output(genes);
+    write_output(windows);
     
     return 0;
 }

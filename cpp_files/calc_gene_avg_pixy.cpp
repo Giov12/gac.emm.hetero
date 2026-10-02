@@ -679,7 +679,6 @@ parse_pixy(const string &table, const string &pop1, const string &pop2,
         markers[chrom].push_back(site);
         found++;
 
-
     } // end of file parsing
 
     close_in_filestream(gzipped, gz_fh, txt_fh);
@@ -831,13 +830,13 @@ int main(int argc, char *argv[]){
         if (arg == "-t" && i + 1 < argc){
             table = string(argv[i + 1]);
         }
-        if (arg == "-a" && i + 1 < argc){
+        else if (arg == "-a" && i + 1 < argc){
             ann = string(argv[i + 1]);
         }
-        if (arg == "--pop1" && i + 1 < argc){
+        else if (arg == "--pop1" && i + 1 < argc){
             pop1 = string(argv[i + 1]);
         }
-        if (arg == "--pop2" && i + 1 < argc){
+        else if (arg == "--pop2" && i + 1 < argc){
             pop2 = string(argv[i + 1]);
         }
         else if (arg == "--merge"){
