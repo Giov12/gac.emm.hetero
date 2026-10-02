@@ -277,12 +277,14 @@ parse_table(const string &infile, const string &pop, const int window){
 
     open_in_filestream(gzipped, gz_fh, txt_fh, infile);
 
-    ofstream ofh("Heterozygous_windows.tsv");
+    ofstream ofh("Homozygous_windows.tsv");
 
     if (!ofh.is_open()){
         cerr << "Unable to create output file in this directory\n";
         exit(1);
     }
+
+    ofh << "#Chrom\tStart\tEnd\tSize\n";
 
     vector<int> positions;
     vector<string> parts;
@@ -422,6 +424,10 @@ int main(int argc, char *argv[]){
     if (!file_exists(infile)){
         cerr << "Unable to find " << infile << '\n';
         exit(1);
+    }
+
+    if (pop.empty()){
+        cerr << "-p POP is required\n";
     }
 
     //
