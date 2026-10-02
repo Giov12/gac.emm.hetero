@@ -246,7 +246,7 @@ parse_pixy(string &table, string &pop1, string &pop2, vector<Window> &windows, c
         exit(1);
     }
 
-    cerr << "Loaded " << windows.size() << " windows\n";
+    cerr << "Loaded " << windows.size() << " windows between " << pop1 << " and " << pop2 << '\n';
 
     return 0; 
 }
