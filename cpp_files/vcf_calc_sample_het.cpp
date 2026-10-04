@@ -5,6 +5,7 @@
 #include <vector>
 #include <zlib.h>
 #include <iomanip>
+#include <algorithm>
 #include <unordered_map>
 
 using std::string;
@@ -15,6 +16,7 @@ using std::vector;
 using std::cerr;
 using std::cout;
 using std::stoi;
+using std::sort;
 using std::unordered_map;
 using std::setprecision;
 
