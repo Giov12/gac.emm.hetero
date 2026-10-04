@@ -184,7 +184,7 @@ def plot_coverages() -> int:
     global cov_files, genomeSize, color_map
 
     # create a shared drawing surface
-    fig, ax = plt.subplots(nrows = 1, ncols = 1, figsize = (16, 5))
+    fig, ax = plt.subplots(nrows = 1, ncols = 1, figsize = (20, 5))
 
     ax.set_ylim(0, 100)
     ax.set_xlim(0, genomeSize)
@@ -214,6 +214,9 @@ def plot_coverages() -> int:
     # add chrom labels
     ax.set_xticks(xticks)
     ax.set_xticklabels(xlabels)
+
+    # add y label
+    ax.set_ylabel("Sequencing Coverage (x)")
 
     # draw the legend
     handles = list()
