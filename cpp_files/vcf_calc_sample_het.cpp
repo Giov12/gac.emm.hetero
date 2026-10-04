@@ -7,6 +7,7 @@
 #include <iomanip>
 #include <algorithm>
 #include <unordered_map>
+#include <unordered_set>
 
 using std::string;
 using std::fstream;
@@ -18,6 +19,7 @@ using std::cout;
 using std::stoi;
 using std::sort;
 using std::unordered_map;
+using std::unordered_set;
 using std::setprecision;
 
 //
@@ -300,9 +302,11 @@ parse_attributes(string &attributes, vector<Attribute> &atrbVec){
 }
 
 int
-parse_annotation(const string &ann, unordered_map<string, vector<Gene*>> &genome){
+parse_annotation(const string &ann, unordered_map<string, vector<Gene*>> &genome,
+                 const bool only_targets, unordered_set<string> &target_genes){
     //
-    // collect only genes on chromosomes with markers
+    // collect genes in this specific file and optionally only
+    // those in the targets container
     //
 
     bool gzipped = is_compressed(ann);
@@ -376,6 +380,9 @@ parse_annotation(const string &ann, unordered_map<string, vector<Gene*>> &genome
                 cerr << "Unable to get gene_id for the following record:\n" << line;
                 exit(1);
             }
+            else if (only_targets && target_genes.count(gene_id) == 0){
+                continue; // skip this
+            }
             chrom = parts[0];
             start = (uint)stoi(parts[3]);
             end   = (uint)stoi(parts[4]);
@@ -437,6 +444,36 @@ parse_annotation(const string &ann, unordered_map<string, vector<Gene*>> &genome
     }
 
     cerr << "Loaded " << total << " genes\n";
+    return 0;
+}
+
+int
+load_target_genes(const string &genes_file, const bool only_targets,
+                  unordered_set<string> &targets){
+
+    // helper function to create a container holding the gene_ids of interest
+
+    if (only_targets == false){
+        return 1; // we are not using this feature
+    }
+
+    std::ifstream fh(genes_file);
+
+    if (!fh.is_open()) {
+        cerr << "Error: Could not open the file " << genes_file << '\n';
+        exit(1);
+    }
+
+    string line;
+    
+    while (getline(fh, line)) {
+        targets.insert(line);
+    }
+
+    fh.close();
+
+    cerr << "Loaded " << targets.size() << " target genes\n";
+
     return 0;
 }
 
@@ -546,6 +583,7 @@ parse_vcf(const string &vcf, const bool only_genic,
     string line, sample, chrom, curChrom;
     uint   pos, ngenes, furthest;
     bool   eof = false; // default value
+    uint valid_sites = 0;
 
     while (true){
         if (gzipped){
@@ -600,6 +638,8 @@ parse_vcf(const string &vcf, const bool only_genic,
         }
         parse_tabular(line, parts);
 
+        bool valid = true;
+
         if (only_genic){ // we care only about the exonic regions
             chrom = parts[0];
 
@@ -629,8 +669,16 @@ parse_vcf(const string &vcf, const bool only_genic,
 
             // this is not an exonic site
             if (!is_exonic(pos, genes, gene_ends)){
-                continue;
+                valid = false;
+                // continue;
             }
+            else {
+                valid_sites++;
+            }
+        }
+
+        if (!valid){
+            continue;
         }
 
         for (uint i = 9; i < parts.size(); i++){
@@ -648,7 +696,11 @@ parse_vcf(const string &vcf, const bool only_genic,
 
     close_in_filestream(gzipped, gz_fh, txt_fh);
 
-    cerr << std::fixed << std::setprecision(2);
+    if (only_genic){
+        cerr << "Total exonic sites scanned " << valid_sites << '\n';
+    }
+
+    cerr << std::fixed << setprecision(3);
     
     for (uint i = 0; i < samples.size(); i++){
         Sample &s = samples[i];
@@ -661,13 +713,13 @@ parse_vcf(const string &vcf, const bool only_genic,
 
 void
 help(){
-    cerr << "Usage: ./vcf_calc_sample_het -v vcf_file -a ann.gtf [optional]\n";
+    cerr << "Usage: ./vcf_calc_sample_het -v vcf_file -a ann.gtf [optional] -g gene_list.txt [optional]\n";
     exit(1);
 }
 
 int main(int argc, char *argv[]){
 
-    string vcf, ann, arg;
+    string vcf, ann, target, arg;
     unordered_map<string, vector<Gene*>> genome;
     
     // expect at least a single argument
@@ -680,8 +732,11 @@ int main(int argc, char *argv[]){
         if (arg == "-v" && i + 1 < argc){
             vcf = argv[i + 1];
         }
-        if (arg == "-a" && i + 1 < argc){
+        else if (arg == "-a" && i + 1 < argc){
             ann = argv[i + 1];
+        }
+        else if (arg == "-t" && i + 1 < argc){
+            target = argv[i + 1];
         }
         else if (arg == "-h"){
             help();
@@ -707,7 +762,17 @@ int main(int argc, char *argv[]){
             cerr << "Unable to find " << ann << '\n';
             exit(1);
         }
-        parse_annotation(ann, genome);
+
+        bool only_targets = !target.empty();
+        // only use a subset of genes based on their gene_ids
+        if (only_targets){
+            if (!file_exists(target)){
+                cerr << "Unable to find " << target << '\n';
+            }
+        }
+        unordered_set<string> target_genes;
+        load_target_genes(target, only_targets, target_genes);
+        parse_annotation(ann, genome, only_targets, target_genes);
     }
     
     // parse the vcf file
