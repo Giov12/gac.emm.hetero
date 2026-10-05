@@ -222,14 +222,17 @@ def get_gene_coordinates() -> int:
     global ymax
 
     significant = load_colors()
+    seen        = set()
+    background  = ["#1F4E79", "#6FA8DC"]
 
     for entry in found_genes:
         chrom   = entry[0]
         gene_id = entry[1]
         bp_pos  = entry[2]
-        value   = entry[3]
-        color   = "#E41A1C" if gene_id in significant else "#6FA8DC"
+        value   = entry[3]     
         if (chrom in chroms): # due to min length filter
+            seen.add(chrom)
+            color = "#E41A1C" if gene_id in significant else background[len(seen) % 2]
             chroms[chrom].gene_ids.append(gene_id)
             chroms[chrom].gene_values.append(value)
             chroms[chrom].gene_positions.append(bp_pos)
@@ -261,8 +264,8 @@ def plot_manhattan() -> int:
         xlabels.append(chrom.name)
         chrom.add_xposition(current_pos)
         current_pos += chrom.length
-        if (i != len(chroms_list)): # not the last chrom
-            ax.axvline(current_pos, color = "black", linestyle = "--")
+        # if (i != len(chroms_list)): # not the last chrom
+        #     ax.axvline(current_pos, color = "black", linestyle = "--")
 
         # now add the scatter point
         plt.scatter(chrom.gene_positions, chrom.gene_values, color = chrom.gene_colors, s = 5)
