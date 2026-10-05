@@ -14,6 +14,7 @@ class Chrom:
         self.gene_colors    = list()
         self.gene_values    = list()
         self.gene_positions = list()
+        self.color          = '' # color for snps
 
     def add_xposition(self, x_pos) -> None:
         for i in range(len(self.gene_positions)):
@@ -92,12 +93,17 @@ def load_chrom_lengths() -> int:
         msg = f"No chromosomes found with a minumum length of {min_len}"
         sys.exit(msg)
 
-    # now set the x positions
+    # now set the x positions & color
     chroms_list.sort(key=lambda x: x[1], reverse=True) # largest chroms first
-    xstart = 0
+    xstart    = 0
+    index     = 0
+    bg_colors = ["#1F4E79", "#6FA8DC"]
+    
     for chrom, chrom_len in chroms_list:
-        xpos_map[chrom] = xstart
-        xstart         += chrom_len
+        chroms[chrom].color = bg_colors[index % 2]
+        xpos_map[chrom]     = xstart
+        xstart             += chrom_len
+        index              += 1
 
     return 0
 
@@ -219,11 +225,9 @@ def get_gene_coordinates() -> int:
     # now to place them onto the chromosomes
     found_genes.sort(key = lambda e: (e[0], e[2]))
 
-    global ymax
+    global ymax, chroms_list
 
     significant = load_colors()
-    seen        = set()
-    background  = ["#1F4E79", "#6FA8DC"]
 
     for entry in found_genes:
         chrom   = entry[0]
@@ -231,8 +235,7 @@ def get_gene_coordinates() -> int:
         bp_pos  = entry[2]
         value   = entry[3]     
         if (chrom in chroms): # due to min length filter
-            seen.add(chrom)
-            color = "#E41A1C" if gene_id in significant else background[len(seen) % 2]
+            color = "#E41A1C" if gene_id in significant else chroms[chrom].color
             chroms[chrom].gene_ids.append(gene_id)
             chroms[chrom].gene_values.append(value)
             chroms[chrom].gene_positions.append(bp_pos)
