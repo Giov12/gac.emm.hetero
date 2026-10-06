@@ -116,15 +116,16 @@ fmt = function(x){
   format(x, big.mark = ",", scientific = FALSE, trim = TRUE)
 }
 
-png(outpng, width = 600 * length(idx), height = 700, res = 300)
-par(mfrow = c(1, length(idx)), mar = c(4.5, 4.5, 3.5, 1))
+nindices = length(idx)
+png(outpng, width = 3 * nindices + 1.5, height = 3.5, units = "in", res = 300)
+layout(matrix(1:(nindices + 1), nrow = 1), widths = c(rep(3, nindices), 1.5))
+par(mar = c(4.5, 4.5, 5, 1))
 
 for (i in idx){
+  ttl = paste0(chrom, "\n", fmt(wins$start[i]), "-", fmt(wins$end[i]))
+  
   if (i == center){
-    ttl = paste0(chrom, "\n", fmt(wins$start[i]), "-", fmt(wins$end[i]), "  (contains position)")
-  }
-  else {
-    ttl = paste0(chrom, "\n", fmt(wins$start[i]), "-", fmt(wins$end[i]))
+    ttl = paste0(ttl, "\n(contains position)")
   }
 
   p = get_pcs(i)
@@ -135,15 +136,17 @@ for (i in idx){
     next
   }
 
-  plot(orient(p$pc1), p$pc2, col = cols, pch = pchs, cex = 1.4, xlab = "PC1", ylab = "PC2", main = ttl, cex.main = 0.9)
-
-  if (i == idx[1]){
-    legend("topright", legend = names(style),
-           col = sapply(style, function(s) s$col),
-           pch = sapply(style, function(s) s$pch),
-           cex = 0.8, bty = "n")
-  }
+  plot(orient(p$pc1), p$pc2, col = cols, pch = pchs, cex = 0.8, xlab = "PC1", ylab = "PC2", main = ttl, cex.main = 0.9)
 }
+# add the legend to the extra margin space
+# last panel holds only the legend
+par(mar = c(0, 0, 0, 0))
+plot.new()
+legend("center", legend = names(style),
+       col = sapply(style, function(s) s$col),
+       pch = sapply(style, function(s) s$pch),
+       cex = 0.9, bty = "n")
+
 invisible(dev.off())
 
 message("Saved ", outpng)
