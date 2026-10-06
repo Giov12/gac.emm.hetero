@@ -116,7 +116,7 @@ fmt = function(x){
   format(x, big.mark = ",", scientific = FALSE, trim = TRUE)
 }
 
-png(outpng, width = 600 * length(idx), height = 700, res = 120)
+png(outpng, width = 600 * length(idx), height = 700, res = 300)
 par(mfrow = c(1, length(idx)), mar = c(4.5, 4.5, 3.5, 1))
 
 for (i in idx){
