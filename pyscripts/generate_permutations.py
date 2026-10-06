@@ -60,7 +60,7 @@ def load_pop_info() -> int:
 
     fh.close()
 
-    print(f"Loaded {len(samples)} samples across {len(pops)}")
+    print(f"Loaded {len(samples)} samples across {len(pops)} populations")
 
     return 0
 
@@ -83,15 +83,19 @@ def permutate() -> int:
             continue # already seen this assignment
         
         seen.add(key)
-        out    = f"{outdir}/popmap_{count}.tsv"
         count += 1
+        outd   = f"{outdir}/perm{count}"
+
+        # place the popmap in its specific directory
+        if (os.path.exists(outd) == False):
+            os.mkdir(outd)
+        out = f"{outd}/popmap_{count}.tsv"
 
         with open(out, 'w') as fh:
             for i in range(number):
                 fh.write(f"{samples[i]}\t{labels[i]}\n")
 
     print(f"Done! Wrote: {perms} permutations in {outdir}/")
-
 
     return 0
 
@@ -105,6 +109,7 @@ def main() -> int:
     load_pop_info()
 
     # now permutate
+    permutate()
 
     return 0
 
