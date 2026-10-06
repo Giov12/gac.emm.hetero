@@ -49,12 +49,34 @@ if (!file.exists(vcf)){
   stop("Could not locate a .bcf file for ", vcf, call. = FALSE)
 }
 
+# if we are exiting this analysis early due to lack of sufficient data
+early_exit = function(state, detail){
+  message(chrom, ": ", state, " - ", detail)
+  writeLines(paste(chrom, state, detail, sep = "\t"), status_file)
+  quit(save = "no", status = 0)
+}
+
+
 # silently create the output directory if it doesn't exist
 dir.create(outdir, showWarnings = FALSE, recursive = TRUE)
 
 # start computing
-sites  = vcf_positions(vcf)
-win_fn = vcf_windower(file = vcf, size = win_size, type = win_type, sites = sites)
+sites = vcf_positions(vcf)
+
+# do we have enough data on this chrom?
+nsnps = max(sapply(sites, length))
+span  = max(sapply(sites, function(p) max(p) - min(p)))
+
+# hard code number minimum number of snps
+min_snps = 20
+if (nsnps < min_snps){
+  early_exit("skipped", paste0("only ", nsnps, " SNPs (minimum ", min_snps, ")"))
+}
+
+# take the minimum
+nsites   = if (win_type == "bp") span else nsnps
+win_size = min(win_size, nsnps)
+win_fn   = vcf_windower(file = vcf, size = win_size, type = win_type, sites = sites)
 
 # compute the pcs
 outpcs  = file.path(outdir, paste0(chrom, ".pcs.rds"))
