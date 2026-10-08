@@ -248,8 +248,8 @@ def plot_region(freq_map : dict[str, Population]) -> int:
         axe.set_xlabel(f"Position on {target_reg[0]} ({unit})")
 
 
-
-    fig.supylabel("Allele frequency", x = 0.005) # add a shared y-label
+    fig.supylabel("Allele frequency", x = 0.01) # add a shared y-label
+    fig.get_layout_engine().set(rect = (0.03, 0, 0.97, 1)) 
     fig.savefig(f"{target_reg[0]}_{target_reg[1]}-{target_reg[2]}.png", dpi = 150)
     plt.close(fig)
         
