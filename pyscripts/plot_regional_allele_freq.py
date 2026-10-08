@@ -26,25 +26,29 @@ class Chrom:
 
 region      = ''
 vcf         = ''
+ann         = ''
 popmap_file = ''
 pops        = list()
 popmap      = dict()
+genes       = defaultdict(list)
 
 def get_arguments() -> int:
     """function to get the users input"""
 
-    global vcf, popmap_file, fai_file, region
+    global vcf, popmap_file, ann, region
 
     # help messages & description
     desc  = "Plot the allele frequency across a specified region for a diploid species"
     rhelp = "region to plot. Format expected CHR:Start-END"
     vhelp = "vcf file"
+    ahelp = "Annotation file in gff3 or gtf format"
     phelp = "population map for samples in vcf"
 
     parser = argparse.ArgumentParser(description=desc)
     parser.add_argument("-r", "--region", required=True, type=str, help=rhelp)
     parser.add_argument("-v", "--vcf",    required=True, type=str, help=vhelp)
     parser.add_argument("-p", "--popmap", required=True, type=str, help=phelp)
+    parser.add_argument("-a", "--ann",    type=str, help=ahelp, default=ann)
 
     args = parser.parse_args()
 
@@ -52,9 +56,13 @@ def get_arguments() -> int:
     assert os.path.isfile(args.popmap), f"Could not locate {args.popmap}"
     assert ':' in args.region,          f"Region expected format: CHR:Start-END"
 
+    if (args.ann != ''):
+        assert os.path.isfile(args.ann), f"Could not locate {args.ann}"
+
     region      = args.region
     vcf         = args.vcf
     popmap_file = args.popmap
+    ann         = args.ann
 
     return 0
 
@@ -112,16 +120,78 @@ def parse_region() -> tuple[str, int, int]:
 
     return (chrom, left, right)
 
+def make_attribute_map(attrb: str) -> dict[str, str]:
+
+    amap   = dict()
+    attrb  = attrb.strip(' "\n') # remove new line char
+    fields = attrb.split(';')
+
+    for field in fields:
+        field = field.strip(' "')
+        if (field == ''):
+            continue
+        idx = field.find(' ') # find index of first space
+        if (idx == -1 or idx == len(field) - 1):
+            idx = field.find('=')
+            if (idx == -1 or idx == len(field) - 1):
+                continue
+        key = field[:idx].lower()
+        key = key.strip(' "')
+        val = field[idx + 1:]
+        val = val.strip(' "')
+        amap[key] = val
+
+    return amap
+
+def parse_ann() -> int:
+    """parse the annotation file if present"""
+
+    global ann, genes
+
+    if (ann == ''):
+        return 1 # nothing to do here
+
+    fh         = gzip.open(ann, "rt") if ann.endswith(".gz") else open(ann, 'r')
+    target_reg = parse_region()
+    target_chr = target_reg[0] + '\t'
+    left       = target_reg[1]
+    right      = target_reg[2]
+
+    for line in fh:
+        if (len(line) == 0 or line[0] == '#' or line.startswith(target_chr) == False):
+            continue
+        fields = line.split('\t')
+        if (fields[2] != "exon"):
+            continue
+        start = int(fields[3])
+        end   = int(fields[4]) # check for some overlap
+        if (start <= right and end >= left):
+            attributes = make_attribute_map(fields[8].strip())
+            gene_name  = attributes["gene_id"]
+            start      = max(start, left)
+            end        = min(end, right)
+            genes[gene_name].append((start, end))
+
+    fh.close()
+
+    print(f"Found {len(genes)} genes in the target region")
+
+    return 0
+
 def plot_region(freq_map : dict[str, Population]) -> int:
     """Plot each population's allele frequency across the genome"""
 
-    global pops
+    global pops, genes
 
     # create a shared drawing surface
     target_reg = parse_region()
     npops      = len(pops)
-    fig, axes  = plt.subplots(nrows = len(pops), ncols = 1, figsize = (20, 1.5 * npops + 1), 
-                            sharex = True, squeeze = False, layout = "constrained")
+    add_genes  = len(genes) > 0
+    nrows      = npops + 1 if add_genes else npops
+    ratios     = [1.0] * npops + ([0.7] if add_genes else [])
+    fig, axes  = plt.subplots(nrows = nrows, ncols = 1, figsize = (20, 1.5 * npops + 1), 
+                            sharex = True, squeeze = False, layout = "constrained",
+                            gridspec_kw = {"height_ratios": ratios})
 
     # estimate the x-axis label scaling
     span = target_reg[2] - target_reg[1]
@@ -146,16 +216,40 @@ def plot_region(freq_map : dict[str, Population]) -> int:
 
         # title will be chromosome
         if (i == 0):
-            axe.set_title(target_reg[0])
+            axe.set_title(f"{target_reg[0]}:{target_reg[1]:,}-{target_reg[2]:,}")
             axe.legend(loc = "upper right", markerscale = 3)
 
         # last row will have the chrom length
-        if (i == npops - 1):
+        if (add_genes == False and i == npops - 1):
             axe.xaxis.set_major_formatter(FuncFormatter(lambda x, _: f"{x / div:,.2f}".rstrip('0').rstrip('.')))
             axe.set_xlabel(f"Position on {target_reg[0]} ({unit})")
 
+    if (add_genes):
+        axe    = axes[-1][0]
+        colors = ["#3B3B3B", "#2A9D8F", "#E9A23B"]  
+        count  = 0
+        for gene, exons in genes.items():
+            color  = colors[count % len(colors)]
+            count += 1
+            spans  = [(start, end - start + 1) for start, end in exons]
+            axe.broken_barh(spans, (0, 1), facecolors = color, edgecolors = color, linewidth = 0.5)
+
+            # now add the gene label
+            # label the first (leftmost) exon, staggered between two heights
+            first_exon = min(start for start, _ in exons)
+            y = -0.15 if count % 2 == 0 else -0.85
+            axe.text(first_exon, y, gene, ha = "left", va = "top",
+                     fontsize = 8, color = color, clip_on = True)
+
+        axe.set_ylim(-1.6, 1)
+        axe.set_yticks([])
+        axe.set_ylabel("Genes", rotation = 90, va = "center")
+        axe.xaxis.set_major_formatter(FuncFormatter(lambda x, _: f"{x / div:,.2f}".rstrip('0').rstrip('.')))
+        axe.set_xlabel(f"Position on {target_reg[0]} ({unit})")
+
+
+
     fig.supylabel("Allele frequency", x = 0.005) # add a shared y-label
-    fig.tight_layout()
     fig.savefig(f"{target_reg[0]}_{target_reg[1]}-{target_reg[2]}.png", dpi = 150)
     plt.close(fig)
         
@@ -239,6 +333,8 @@ def parse_vcf() -> dict[str, Population]:
 
     if (sites == 0):
         sys.exit(f"No records found in {target_chr}:{left}-{right}")
+    else:
+        print(f"Found {sites} variant positions in {target_chr}:{left}-{right}")
 
     return freq_map
 
@@ -253,6 +349,9 @@ def main() -> int:
 
     # parse the vcf
     freq_map = parse_vcf()
+
+    # see if any genes will be added to the fig
+    parse_ann()
 
     # now plot
     plot_region(freq_map)
