@@ -6,17 +6,20 @@ import os
 import gzip
 import numpy as np
 import matplotlib.pyplot as plt
+from matplotlib.lines import Line2D
 from collections import defaultdict
 
 ann     = '' # single annotation file
 vcf     = ''
 tarFile = '' # target file containg gene_ids
 popFile = '' # file of <sample> <hex color>
+legFile = '' # file of <hex color> <plot legend ID>
 outdir  = '.'
 minVar  = 2
 targets = set()
 genes   = defaultdict(list) # chrom -> [Gene class]
 colmap  = dict()            # sample  -> color
+legmap  = dict()            # hexcolor -> pop name in legend
 class Gene:
 
     __slots__ = ("chrom", "start", "end", "exons", "genotypes", "id")
@@ -85,18 +88,20 @@ def assert_file_exists(file_path: str) -> int:
 def parse_command_line() -> int:
     """helper function to get the user's arguments to ensure a proper start"""
 
-    global outdir, ann, popFile, vcf, tarFile, minVar
+    global outdir, ann, popFile, vcf, tarFile, minVar, legFile
     
     desc  = "Generate a gene-specific PCA for the target genes using only exonic variants"
     ahelp = "Gene annotation file in GFF3/GTF format"
     ohelp = "Path to output directory to place images"
     ghelp = "Single column list of gene_ids found in annotation"
     shelp = "Two column tsv file containing sample and hex value for PCA color point"
+    lhelp = "Two column tsv file containing hex value and pop ID for PCA Legend"
     vhelp = "Vcf file containing samples found in --samples"
     mhelp = "Minimum number of variant sites required per gene"
     
     parser = argparse.ArgumentParser(description=desc)
     parser.add_argument("-s", "--samples", required=True,  type=str, help=shelp)
+    parser.add_argument("-l", "--legend",  required=True,  type=str, help=lhelp)
     parser.add_argument("-v", "--vcf",     required=True,  type=str, help=vhelp)
     parser.add_argument("-g", "--genes",   required=True,  type=str, help=ghelp)
     parser.add_argument("-a", "--ann",     required=True,  type=str, help=ahelp)
@@ -105,6 +110,7 @@ def parse_command_line() -> int:
 
     args = parser.parse_args()
     assert os.path.isfile(args.samples), f"Could not find {args.samples}"
+    assert os.path.isfile(args.legend),  f"Could not find {args.legend}"
     assert os.path.isfile(args.vcf),     f"Could not find {args.vcf}"
     assert os.path.isfile(args.genes),   f"Could not find {args.genes}"
     assert os.path.isfile(args.ann),     f"Could not find {args.ann}"
@@ -112,6 +118,7 @@ def parse_command_line() -> int:
     assert args.min > 1,                 f"--min must be at least 2"
 
     popFile = args.samples
+    legFile = args.legend
     vcf     = args.vcf
     tarFile = args.genes
     ann     = args.ann
@@ -164,6 +171,35 @@ def load_color_map() -> int:
         sys.exit(f"No samples found in {popFile}")
 
     print(f"Loaded {len(colmap)} samples from {popFile}")
+
+    return 0
+
+def load_color_legend() -> int:
+    """load each color and their legend ID"""
+
+    global legFile, legmap, colmap
+
+    fh = gzip.open(legFile, "rt") if legFile.endswith(".gz") else open(legFile, 'r')
+
+    for line in fh:
+        if (len(line) == 0):
+            continue
+        fields = line.split('\t')
+        assert len(fields) == 2, f"Malformed line detected in {legFile}:\n{line}"
+        assert fields[0][0] == '#', f"First column in {legFile} should be a hex value. Found {fields[0]}"
+        color          = fields[0]
+        legID          = fields[1].strip()
+        legmap[color]  = legID
+
+    fh.close()
+
+    if (len(legmap) == 0):
+        sys.exit(f"No legend IDs found in {legFile}")
+
+    # validate
+    for sample, color in colmap.items():
+        if (color not in legmap):
+            sys.exit(f"Color {color} for sample {sample} is not in {legFile}")
 
     return 0
 
@@ -335,7 +371,8 @@ def parse_vcf() -> int:
     curChrom    = ''
     sites       = 0
     fh          = gzip.open(vcf, "rt") if vcf.endswith(".gz") else open(vcf, 'r')
-    genomap     = {"0/0": 0, "0/1": 1, "1/1": 2, "./.": -1}
+    genomap     =  {"0/0": 0, "0/1": 1, "1/0": 1, "1/1": 2,
+                    "0|0": 0, "0|1": 1, "1|0": 1, "1|1": 2}
 
     for line in fh:
         if (len(line) == 0):
@@ -448,17 +485,26 @@ def run_pca(gene: Gene, samples: list[str]) -> tuple[np.ndarray, np.ndarray, int
 def plot_pca(gene: Gene, samples: list[str], scores: np.ndarray, var: np.ndarray, nsites: int) -> int:
     """scatter plot of PC1 and PC2 colored by the user's sample colors"""
 
-    global colmap, outdir
+    global colmap, outdir, legmap
 
     colors  = [colmap[sample] for sample in samples] # preserve order
     name    = gene.id.replace("/", '_')              # avoid adding to path
     outpath = f"{outdir}/{name}.pca.png"
+    handles = list()
 
+    # create the legend
+    for color, legID in legmap.items():
+        legend = Line2D([0], [0], marker = 'o', color = 'w', markerfacecolor = color,
+                        markeredgecolor = "black", markeredgewidth = 0.5, markersize = 8, label = legID)
+        handles.append(legend)
+
+    # now plot
     fig, ax = plt.subplots(figsize = (6, 6))
     ax.scatter(scores[:, 0], scores[:, 1], c = colors, s = 35, edgecolors = "black", linewidths = 0.5)
     ax.set_xlabel(f"PC1 ({var[0] * 100:.1f}%)")
     ax.set_ylabel(f"PC2 ({var[1] * 100:.1f}%)")
     ax.set_title(f"{gene.id} ({nsites} variable exonic sites)")
+    ax.legend(handles = handles, frameon = False, loc = "center left", bbox_to_anchor = (1.02, 0.5))
     fig.savefig(outpath, dpi = 300, bbox_inches = "tight")
     plt.close(fig)
 
@@ -506,6 +552,9 @@ def main() -> int:
 
     # get the sample information
     load_color_map()
+
+    # load the legend
+    load_color_legend()
 
     # construct the gene objects
     parse_ann()
