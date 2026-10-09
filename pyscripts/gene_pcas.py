@@ -77,14 +77,6 @@ class Gene:
     def has_variants(self) -> bool:
         return len(self.genotypes) > 0
     
-def assert_file_exists(file_path: str) -> int:
-    """avoid copy and pasting the same assert function"""
-
-    assert os.path.isfile(file_path), f"Could not locate {file_path}"
-
-    return 0
-
-
 def parse_command_line() -> int:
     """helper function to get the user's arguments to ensure a proper start"""
 
