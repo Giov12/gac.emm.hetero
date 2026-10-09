@@ -4,18 +4,19 @@ import argparse
 import sys
 import os
 import gzip
+import numpy as np
+import matplotlib.pyplot as plt
 from collections import defaultdict
 
-outdir  = '' # output directory
 ann     = '' # single annotation file
 vcf     = ''
-tarFile = '' # target file
+tarFile = '' # target file containg gene_ids
 popFile = '' # file of <sample> <hex color>
+outdir  = '.'
+minVar  = 2
 targets = set()
 genes   = defaultdict(list) # chrom -> [Gene class]
 colmap  = dict()            # sample  -> color
-ann     = list()            # annotation file
-
 class Gene:
 
     __slots__ = ("chrom", "start", "end", "exons", "genotypes", "id")
@@ -27,7 +28,6 @@ class Gene:
         self.id        = ''
         self.exons     = list()
         self.genotypes = defaultdict(list) # sample: list[genotypes]
-        
 
     def add_exon(self, start: int, end: int) -> int:
         # just add the exon for now, we will resolve later
@@ -37,9 +37,27 @@ class Gene:
     def resolve_exons(self) -> int:
 
         # merge and collapse any overlapping exons
-        resolved = list()
 
+        if (len(self.exons) <= 1):
+            return 1 # nothing to resolve
+
+        self.exons.sort(key = lambda e: e[0])
+        resolved = [self.exons[0]]
+
+        i = 1
+        while (i < len(self.exons)):
+            prev_exon = resolved[-1]
+            next_exon = self.exons[i]
+            if (next_exon[0] <= prev_exon[1]):
+                if (next_exon[1] > prev_exon[1]): # merge
+                    resolved[-1] = (prev_exon[0], next_exon[1]) # tuples are immutable
+            else:
+                resolved.append(next_exon)
+            i += 1
+        
         self.exons = resolved
+
+        return 0
 
     def is_exonic(self, pos: int) -> bool:
 
@@ -48,6 +66,13 @@ class Gene:
                 return True
 
         return False
+
+    def add_genotype(self, sample: str, genotype: int) -> int:
+        self.genotypes[sample].append(genotype)
+        return 0
+    
+    def has_variants(self) -> bool:
+        return len(self.genotypes) > 0
     
 def assert_file_exists(file_path: str) -> int:
     """avoid copy and pasting the same assert function"""
@@ -60,7 +85,7 @@ def assert_file_exists(file_path: str) -> int:
 def parse_command_line() -> int:
     """helper function to get the user's arguments to ensure a proper start"""
 
-    global outdir, ann, popFile, vcf, tarFile
+    global outdir, ann, popFile, vcf, tarFile, minVar
     
     desc  = "Generate a gene-specific PCA for the target genes using only exonic variants"
     ahelp = "Gene annotation file in GFF3/GTF format"
@@ -68,13 +93,15 @@ def parse_command_line() -> int:
     ghelp = "Single column list of gene_ids found in annotation"
     shelp = "Two column tsv file containing sample and hex value for PCA color point"
     vhelp = "Vcf file containing samples found in --samples"
+    mhelp = "Minimum number of variant sites required per gene"
     
     parser = argparse.ArgumentParser(description=desc)
-    parser.add_argument("-s", "--samples", required=True, type=str, help=shelp)
-    parser.add_argument("-v", "--vcf",     required=True, type=str, help=vhelp)
-    parser.add_argument("-g", "--genes",   required=True, type=str, help=ghelp)
-    parser.add_argument("-a", "--ann",     required=True, type=str, help=ahelp)
+    parser.add_argument("-s", "--samples", required=True,  type=str, help=shelp)
+    parser.add_argument("-v", "--vcf",     required=True,  type=str, help=vhelp)
+    parser.add_argument("-g", "--genes",   required=True,  type=str, help=ghelp)
+    parser.add_argument("-a", "--ann",     required=True,  type=str, help=ahelp)
     parser.add_argument("-o", "--outdir",  default=outdir, type=str, help=ohelp)
+    parser.add_argument("-m", "--min",     default=minVar, type=int, help=mhelp)
 
     args = parser.parse_args()
     assert os.path.isfile(args.samples), f"Could not find {args.samples}"
@@ -82,12 +109,14 @@ def parse_command_line() -> int:
     assert os.path.isfile(args.genes),   f"Could not find {args.genes}"
     assert os.path.isfile(args.ann),     f"Could not find {args.ann}"
     assert os.path.isdir(args.outdir),   f"Could not find {args.outdir}"
+    assert args.min > 1,                 f"--min must be at least 2"
 
     popFile = args.samples
     vcf     = args.vcf
     tarFile = args.genes
     ann     = args.ann
-    outdir  = args.outdir
+    outdir  = args.outdir.rstrip('/')
+    minVar  = args.min
 
     return 0
 
@@ -208,13 +237,14 @@ def parse_ann() -> int:
     fh       = gzip.open(ann, "rt") if ann.endswith(".gz") else open(ann, 'r')
     is_gff   = ".gff" in ann
     gene_map = dict()
+    total    = 0
     lineNum  = 0
     found    = False
     gene_id  = ''
 
     for line in fh:
         lineNum += 1
-        if (len(line) == '' or line[0] == '#'):
+        if (len(line) == 0 or line[0] == '#'):
             continue
         fields = line.split('\t')
 
@@ -263,14 +293,15 @@ def parse_ann() -> int:
             
     fh.close()
 
-    if (len(genes) == 0):
+    if (len(gene_map) == 0):
         sys.exit(f"Did not find any target genes in {ann}")
 
-    print(f"Found {len(genes)} out of {len(targets)} genes in {ann}")
+    print(f"Found {len(gene_map)} out of {len(targets)} genes in {ann}")
 
     # place each gene into their chromosome buckets
     for gene_id, gene in gene_map.items():
-        gene.id = gene_id # assign ID now
+        gene.id = gene_id    # assign ID now
+        gene.resolve_exons() # collapse exons
         genes[gene.chrom].append(gene)
 
     # now sort for binary search later on
@@ -282,6 +313,15 @@ def parse_ann() -> int:
 def get_overlapping_genes(left: int, pos: int, gene_list: list[Gene], gene_ends: list[int], entries: list[Gene]) -> int:
     """for every overlapping gene, add the it to entries list if pos is exonic"""
 
+    while (left < len(gene_list)):
+        gene = gene_list[left]
+        if (gene.start <= pos <= gene.end):
+            if (gene.is_exonic(pos)):
+                entries.append(gene)
+        elif (gene.start > pos):
+            break
+        left += 1
+
     return 0
 
 def parse_vcf() -> int:
@@ -289,13 +329,192 @@ def parse_vcf() -> int:
 
     global vcf, genes, colmap
 
-    nsamples = len(colmap) # expected number of samples
+    samples     = list()
+    gene_ends   = list()
+    chrom_genes = list()
+    curChrom    = ''
+    sites       = 0
+    fh          = gzip.open(vcf, "rt") if vcf.endswith(".gz") else open(vcf, 'r')
+    genomap     = {"0/0": 0, "0/1": 1, "1/1": 2, "./.": -1}
+
+    for line in fh:
+        if (len(line) == 0):
+            continue
+        if (line[0] == '#'):
+            if (line.startswith("#CHROM")):
+                fields     = line.split('\t')
+                fields[-1] = fields[-1].strip() # remove end line char
+                for i in range(9, len(fields)):
+                    sample = fields[i]
+                    if (sample not in colmap):
+                        sys.exit(f"Vcf must have the same samples as --samples. Encountered {sample}")
+                    samples.append(sample)
+                assert len(samples) == len(colmap), f"Not every sample in --samples was found in vcf file"
+            continue
+        if (len(samples) == 0):
+            sys.exit(f"ERROR: Did not encounter #CHROM header in {vcf}")
+        head   = line.split('\t', 2)
+        chrom  = head[0]
+        if (chrom not in genes):
+            continue # not target genes on this chrom
+        if (curChrom != chrom):
+            # we need to update the gene ends
+            curChrom    = chrom
+            chrom_genes = genes[chrom]
+            gene_ends   = [0] * len(chrom_genes)
+            longest     = 0
+            for i in range(len(chrom_genes)):
+                longest      = max(longest, chrom_genes[i].end)
+                gene_ends[i] = longest
+        # check if this site overlaps any genes
+        pos   = int(head[1])
+        left  = 0
+        right = len(chrom_genes)
+
+        while (left < right):
+            mid = left + (right - left) // 2
+            if (gene_ends[mid] >= pos):
+                right = mid
+            else:
+                left = mid + 1
+
+        # check if we stopped anywhere
+        found = False
+        if (left < len(chrom_genes)):
+            gene  = chrom_genes[left]
+            found = gene.start <= pos
+        if (found):
+            entries = list() # collect genes where the pos is exonic
+            get_overlapping_genes(left, pos, chrom_genes, gene_ends, entries)
+
+            # position was intronic
+            if (len(entries) == 0):
+                continue
+            sites  += 1
+            # add each sample's genotype to each gene
+            fields     = line.split('\t')
+            fields[-1] = fields[-1].strip()
+            missing    = list()
+            total      = 0
+            count      = 0
+            for i in range(9, len(fields)):
+                sample = samples[i - 9]
+                geno   = fields[i].split(':')[0]
+                if (geno.count('.') == 0):
+                    count += 1
+                    score  = genomap[geno]
+                    total += score
+                    for j in range(len(entries)):
+                        entries[j].add_genotype(sample, score)
+                else:
+                    missing.append(sample)
+            # treat missing value as averages
+            score = 0 if total == 0 else total / count
+            for sample in missing:
+                for j in range(len(entries)):
+                    entries[j].add_genotype(sample, score)
+
+    fh.close()
+
+    if (sites == 0):
+        sys.exit("No variant sites found in any target genes")
+    else:
+        print(f"Total number of sites found: {sites}")
+
+    return 0
+
+def run_pca(gene: Gene, samples: list[str]) -> tuple[np.ndarray, np.ndarray, int]:
+    """center the genotype matrix and use an SVD to get PC1 & PC2"""
+
+    global minVar
+
+    # create a matrix
+    mat = np.array([gene.genotypes[sample] for sample in samples], dtype=float)
+
+    # remove invariant sites
+    mat    = mat[:, mat.std(axis = 0) > 0]
+    nsites = mat.shape[1]
+
+    if (nsites < minVar or mat.shape[0] < 3):
+        return tuple([])
+
+    mat           = mat - mat.mean(axis = 0)
+    U, S, Vt      = np.linalg.svd(mat, full_matrices=False)
+    scores        = U * S
+    var_explained = (S**2) / np.sum(S ** 2)
+
+    return (scores[:, :2], var_explained[:2], nsites)
+
+def plot_pca(gene: Gene, samples: list[str], scores: np.ndarray, var: np.ndarray, nsites: int) -> int:
+    """scatter plot of PC1 and PC2 colored by the user's sample colors"""
+
+    global colmap, outdir
+
+    colors  = [colmap[sample] for sample in samples] # preserve order
+    name    = gene.id.replace("/", '_')              # avoid adding to path
+    outpath = f"{outdir}/{name}.pca.png"
+
+    fig, ax = plt.subplots(figsize = (6, 6))
+    ax.scatter(scores[:, 0], scores[:, 1], c = colors, s = 35, edgecolors = "black", linewidths = 0.5)
+    ax.set_xlabel(f"PC1 ({var[0] * 100:.1f}%)")
+    ax.set_ylabel(f"PC2 ({var[1] * 100:.1f}%)")
+    ax.set_title(f"{gene.id} ({nsites} variable exonic sites)")
+    fig.savefig(outpath, dpi = 300, bbox_inches = "tight")
+    plt.close(fig)
+
+    return 0
+
+def run_pcas() -> int:
+    """run and plot a PCA for each target gene that has enough variants"""
+
+    global genes, colmap
+
+    samples = list(colmap.keys())
+    done    = 0
+    skipped = 0
+
+    for chrom_genes in genes.values():
+        for gene in chrom_genes:
+            if (gene.has_variants() == False):
+                skipped += 1
+                continue
+            results = run_pca(gene, samples)
+            if (len(results) == 0):
+                skipped += 1
+                continue
+            scores = results[0]
+            var    = results[1]
+            nsites = results[2]
+            plot_pca(gene, samples, scores, var, nsites)
+            done  += 1
+
+    if (done == 0):
+        sys.exit("No genes has enough variable sites for a PCA")
+
+    print(f"Plotted PCA for {done} genes. Skipped {skipped} genes with too few or no variable sites")
+
+    return 0
 
 def main() -> int:
     """entry point to this initiate the entire process"""
-    
+
+    # get the inputs
     parse_command_line()
 
+    # load the target genes
+    load_target_genes()
+
+    # get the sample information
+    load_color_map()
+
+    # construct the gene objects
+    parse_ann()
+
+    # now collect variant positions
+    parse_vcf()
+
+    # now do a PCA on each gene
+    run_pcas()
 
     return 0
         
