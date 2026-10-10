@@ -88,20 +88,18 @@ class Gene:
 def parse_command_line() -> int:
     """helper function to get the user's arguments to ensure a proper start"""
 
-    global outdir, ann, popFile, vcf, tarFile, minVar, legFile
+    global outdir, ann, popFile, vcf, tarFile, minVar
     
     desc  = "Generate a gene-specific PCA for the target genes using only exonic variants"
     ahelp = "Gene annotation file in GFF3/GTF format"
     ohelp = "Path to output directory to place images"
     ghelp = "Single column list of gene_ids found in annotation"
     shelp = "Four column tsv file containing sample and hex value for PCA color point, population ID, and sex [M/F]"
-    lhelp = "Two column tsv file containing hex value and pop ID for PCA Legend"
     vhelp = "Vcf file containing samples found in --samples"
     mhelp = "Minimum number of variant sites required per gene"
     
     parser = argparse.ArgumentParser(description=desc)
     parser.add_argument("-s", "--samples", required=True,  type=str, help=shelp)
-    parser.add_argument("-l", "--legend",  required=True,  type=str, help=lhelp)
     parser.add_argument("-v", "--vcf",     required=True,  type=str, help=vhelp)
     parser.add_argument("-g", "--genes",   required=True,  type=str, help=ghelp)
     parser.add_argument("-a", "--ann",     required=True,  type=str, help=ahelp)
@@ -110,7 +108,6 @@ def parse_command_line() -> int:
 
     args = parser.parse_args()
     assert os.path.isfile(args.samples), f"Could not find {args.samples}"
-    assert os.path.isfile(args.legend),  f"Could not find {args.legend}"
     assert os.path.isfile(args.vcf),     f"Could not find {args.vcf}"
     assert os.path.isfile(args.genes),   f"Could not find {args.genes}"
     assert os.path.isfile(args.ann),     f"Could not find {args.ann}"
@@ -118,7 +115,6 @@ def parse_command_line() -> int:
     assert args.min > 1,                 f"--min must be at least 2"
 
     popFile = args.samples
-    legFile = args.legend
     vcf     = args.vcf
     tarFile = args.genes
     ann     = args.ann
