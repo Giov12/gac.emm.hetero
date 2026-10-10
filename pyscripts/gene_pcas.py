@@ -13,13 +13,21 @@ ann     = '' # single annotation file
 vcf     = ''
 tarFile = '' # target file containg gene_ids
 popFile = '' # file of <sample> <hex color>
-legFile = '' # file of <hex color> <plot legend ID>
 outdir  = '.'
 minVar  = 2
 targets = set()
 genes   = defaultdict(list) # chrom -> [Gene class]
-colmap  = dict()            # sample  -> color
-legmap  = dict()            # hexcolor -> pop name in legend
+samples = dict()            # sample  -> Sample
+
+class Sample:
+
+    __slots__ = ("id", "color", "population", "sex")
+
+    def __init__(self, id: str, color: str, population: str, sex: str) -> None:
+        self.id         = id
+        self.color      = color
+        self.population = population
+        self.sex        = sex
 class Gene:
 
     __slots__ = ("chrom", "start", "end", "exons", "genotypes", "id")
@@ -86,7 +94,7 @@ def parse_command_line() -> int:
     ahelp = "Gene annotation file in GFF3/GTF format"
     ohelp = "Path to output directory to place images"
     ghelp = "Single column list of gene_ids found in annotation"
-    shelp = "Two column tsv file containing sample and hex value for PCA color point"
+    shelp = "Four column tsv file containing sample and hex value for PCA color point, population ID, and sex [M/F]"
     lhelp = "Two column tsv file containing hex value and pop ID for PCA Legend"
     vhelp = "Vcf file containing samples found in --samples"
     mhelp = "Minimum number of variant sites required per gene"
@@ -140,10 +148,10 @@ def load_target_genes() -> int:
     print(f"Loaded {len(targets)} target genes from {tarFile}")
     return 0
 
-def load_color_map() -> int:
+def load_samples() -> int:
     """load each sample and their color in the pca plots"""
 
-    global colmap, popFile
+    global samples, popFile
 
     fh = gzip.open(popFile, "rt") if popFile.endswith(".gz") else open(popFile, 'r')
 
@@ -151,47 +159,21 @@ def load_color_map() -> int:
         if (len(line) == 0):
             continue
         fields = line.split('\t')
-        assert len(fields) == 2, f"Malformed line detected in {popFile}:\n{line}"
-        assert fields[1][0] == '#', f"Second column in {popFile} should be a hex value. Found {fields[1]}"
-        sample         = fields[0]
-        color          = fields[1].strip()
-        colmap[sample] = color
+        assert len(fields) == 4, f"Malformed line detected in {popFile}:\n{line}"
+        sample_id  = fields[0]
+        color      = fields[1]
+        population = fields[2]
+        sex        = fields[3].strip()
+        assert color[0] == '#', f"Second column in {popFile} should be a hex value. Found {color}"
+        assert sex in "MF", "Valid sex info options: M, F"
+        samples[sample_id] = Sample(sample_id, color, population, sex)
 
     fh.close()
 
-    if (len(colmap) == 0):
+    if (len(samples) == 0):
         sys.exit(f"No samples found in {popFile}")
 
-    print(f"Loaded {len(colmap)} samples from {popFile}")
-
-    return 0
-
-def load_color_legend() -> int:
-    """load each color and their legend ID"""
-
-    global legFile, legmap, colmap
-
-    fh = gzip.open(legFile, "rt") if legFile.endswith(".gz") else open(legFile, 'r')
-
-    for line in fh:
-        if (len(line) == 0):
-            continue
-        fields = line.split('\t')
-        assert len(fields) == 2, f"Malformed line detected in {legFile}:\n{line}"
-        assert fields[0][0] == '#', f"First column in {legFile} should be a hex value. Found {fields[0]}"
-        color          = fields[0]
-        legID          = fields[1].strip()
-        legmap[color]  = legID
-
-    fh.close()
-
-    if (len(legmap) == 0):
-        sys.exit(f"No legend IDs found in {legFile}")
-
-    # validate
-    for sample, color in colmap.items():
-        if (color not in legmap):
-            sys.exit(f"Color {color} for sample {sample} is not in {legFile}")
+    print(f"Loaded {len(samples)} samples from {popFile}")
 
     return 0
 
@@ -355,9 +337,9 @@ def get_overlapping_genes(left: int, pos: int, gene_list: list[Gene], gene_ends:
 def parse_vcf() -> int:
     """go through the vcf and find exonic variants for the target genes"""
 
-    global vcf, genes, colmap
+    global vcf, genes, samples
 
-    samples     = list()
+    samples_ls  = list()
     gene_ends   = list()
     chrom_genes = list()
     curChrom    = ''
@@ -375,12 +357,12 @@ def parse_vcf() -> int:
                 fields[-1] = fields[-1].strip() # remove end line char
                 for i in range(9, len(fields)):
                     sample = fields[i]
-                    if (sample not in colmap):
+                    if (sample not in samples):
                         sys.exit(f"Vcf must have the same samples as --samples. Encountered {sample}")
-                    samples.append(sample)
-                assert len(samples) == len(colmap), f"Not every sample in --samples was found in vcf file"
+                    samples_ls.append(sample)
+                assert len(samples_ls) == len(samples), f"Not every sample in --samples was found in vcf file"
             continue
-        if (len(samples) == 0):
+        if (len(samples_ls) == 0):
             sys.exit(f"ERROR: Did not encounter #CHROM header in {vcf}")
         head   = line.split('\t', 2)
         chrom  = head[0]
@@ -427,7 +409,7 @@ def parse_vcf() -> int:
             total      = 0
             count      = 0
             for i in range(9, len(fields)):
-                sample = samples[i - 9]
+                sample = samples_ls[i - 9]
                 geno   = fields[i].split(':')[0]
                 if (geno.count('.') == 0):
                     count += 1
@@ -452,13 +434,13 @@ def parse_vcf() -> int:
 
     return 0
 
-def run_pca(gene: Gene, samples: list[str]) -> tuple[np.ndarray, np.ndarray, int]:
+def run_pca(gene: Gene, samples_ls: list[str]) -> tuple[np.ndarray, np.ndarray, int]:
     """center the genotype matrix and use an SVD to get PC1 & PC2"""
 
     global minVar
 
     # create a matrix
-    mat = np.array([gene.genotypes[sample] for sample in samples], dtype=float)
+    mat = np.array([gene.genotypes[sample] for sample in samples_ls], dtype=float)
 
     # remove invariant sites
     mat    = mat[:, mat.std(axis = 0) > 0]
@@ -474,12 +456,24 @@ def run_pca(gene: Gene, samples: list[str]) -> tuple[np.ndarray, np.ndarray, int
 
     return (scores[:, :2], var_explained[:2], nsites)
 
-def plot_pca(gene: Gene, samples: list[str], scores: np.ndarray, var: np.ndarray, nsites: int) -> int:
+def plot_pca(gene: Gene, samples_ls: list[str], scores: np.ndarray, var: np.ndarray, nsites: int) -> int:
     """scatter plot of PC1 and PC2 colored by the user's sample colors"""
 
-    global colmap, outdir, legmap
+    global samples, outdir
 
-    colors  = [colmap[sample] for sample in samples] # preserve order
+    # create the colors and legends features
+    colors = list()
+    shapes = list()
+    legmap = dict()
+
+    for sample in samples_ls:
+        color = samples[sample].color
+        shape = 'o' if samples[sample].sex == 'M' else '^'
+        colors.append(color)
+        shapes.append(shape)
+        if (color not in legmap):
+            legmap[color] = samples[sample].population
+
     name    = gene.id.replace("/", '_')              # avoid adding to path
     outpath = f"{outdir}/{name}.pca.png"
     handles = list()
@@ -490,13 +484,29 @@ def plot_pca(gene: Gene, samples: list[str], scores: np.ndarray, var: np.ndarray
                         markeredgecolor = "black", markeredgewidth = 0.5, markersize = 8, label = legID)
         handles.append(legend)
 
+    # add the sex shapes
+    sexes = {'o': "Male", '^': "Female"}
+    for shape, label in sexes.items():
+        if (shape not in shapes):
+            continue
+        legend = Line2D([0], [0], marker = shape, color = 'w', markerfacecolor = "gray",
+                        markeredgecolor = "black", markeredgewidth = 0.5, markersize = 8, label = label)
+        handles.append(legend)
+
     # now plot
-    fig, ax = plt.subplots(figsize = (6, 6))
-    ax.scatter(scores[:, 0], scores[:, 1], c = colors, s = 35, edgecolors = "black", linewidths = 0.5)
+    fig, ax   = plt.subplots(figsize = (6, 6))
+    colors_np = np.array(colors)
+    shapes_np = np.array(shapes)
+    for shape in ('o', '^'):
+        mask = shapes_np == shape
+        if (mask.any()):
+            ax.scatter(scores[mask, 0], scores[mask, 1], c = colors_np[mask].tolist(), s = 35,
+                       marker = shape, edgecolors = "black", linewidths = 0.5)
     ax.set_xlabel(f"PC1 ({var[0] * 100:.1f}%)")
     ax.set_ylabel(f"PC2 ({var[1] * 100:.1f}%)")
     ax.set_title(f"{gene.id} ({nsites} variable exonic sites)")
     ax.legend(handles = handles, frameon = False, loc = "center left", bbox_to_anchor = (1.02, 0.5))
+
     fig.savefig(outpath, dpi = 300, bbox_inches = "tight")
     plt.close(fig)
 
@@ -505,25 +515,25 @@ def plot_pca(gene: Gene, samples: list[str], scores: np.ndarray, var: np.ndarray
 def run_pcas() -> int:
     """run and plot a PCA for each target gene that has enough variants"""
 
-    global genes, colmap
+    global genes, samples
 
-    samples = list(colmap.keys())
-    done    = 0
-    skipped = 0
+    samples_ls = list(samples.keys())
+    done       = 0
+    skipped    = 0
 
     for chrom_genes in genes.values():
         for gene in chrom_genes:
             if (gene.has_variants() == False):
                 skipped += 1
                 continue
-            results = run_pca(gene, samples)
+            results = run_pca(gene, samples_ls)
             if (len(results) == 0):
                 skipped += 1
                 continue
             scores = results[0]
             var    = results[1]
             nsites = results[2]
-            plot_pca(gene, samples, scores, var, nsites)
+            plot_pca(gene, samples_ls, scores, var, nsites)
             done  += 1
 
     if (done == 0):
@@ -543,10 +553,7 @@ def main() -> int:
     load_target_genes()
 
     # get the sample information
-    load_color_map()
-
-    # load the legend
-    load_color_legend()
+    load_samples()
 
     # construct the gene objects
     parse_ann()
