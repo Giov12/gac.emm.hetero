@@ -335,15 +335,20 @@ bootstrap(vector<Window> &windows, const uint bootstraps, const uint threads, co
 }
 
 int
-write_output(vector<Window> &windows){
+write_output(vector<Window> &windows, string &outname){
  
     //
     // write a simple 3-column tsv
     // where window ID, score, pvalue
     //
 
-    string outname = "Window_pvalues.tsv";
+    outname = outname.empty() ? "Window_pvalues.tsv" : outname;
     ofstream fh(outname);
+
+    if (!fh.is_open()){
+        cerr << "Failed to create output file.\nPermissions denied? Disk full?\n";
+        exit(1);
+    }
 
     if (!fh.is_open()){
         cerr << "Error: Unable to write " << outname << " in this directory\n";
@@ -403,13 +408,13 @@ create_uint(const char *arg, const uint n){
 
 void
 help(){
-    cerr << "Usage: ./bootstrap_pixy -f pixy_results.txt --pop1 POP1 --pop2 POP2 --bootstraps INT [default: 10000] --threads INT [default 1] --seed INT [default 1234] --skip_nodata [optional]\n";
+    cerr << "Usage: ./bootstrap_pixy -f pixy_results.txt --pop1 POP1 --pop2 POP2 --bootstraps INT [default: 10000] --threads INT [default 1] --seed INT [default 1234] --skip_nodata [optional] --out [optional]\n";
     exit(1);
 }
 
 int main(int argc, char *argv[]){
 
-    string infile, pop1, pop2;
+    string infile, pop1, pop2, outname, arg;
     uint bootstraps  = 10000;
     uint threads     = 1;
     uint seed        = 1234;
@@ -438,10 +443,13 @@ int main(int argc, char *argv[]){
             seed = create_uint(argv[i + 1], 2);
         }
         else if (arg == "--pop1" && i + 1 < argc){
-            pop1 = string(argv[i + 1]);
+            pop1 = argv[i + 1];
         }
         else if (arg == "--pop2" && i + 1 < argc){
-            pop2 = string(argv[i + 1]);
+            pop2 = argv[i + 1];
+        }
+        else if (arg == "--out" && i + 1 < argc){
+            outname = argv[i + 1];
         }
         else if (arg == "-h"){
             help();
@@ -494,7 +502,7 @@ int main(int argc, char *argv[]){
     bootstrap(windows, bootstraps, threads, seed);
 
     // write the output
-    write_output(windows);
+    write_output(windows, outname);
     
     return 0;
 }

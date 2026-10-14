@@ -766,17 +766,25 @@ overlap_genes(unordered_map<string, vector<Gene*>> &genome,
 }
 
 int
-write_output(unordered_map<string, vector<Gene *>> &genome, bool const merge_exons){
+write_output(unordered_map<string, vector<Gene *>> &genome, bool const merge_exons, string &outname){
     //
     // write a tsv where each
     // 
     //
 
     string gene_id, gene_name;
-    string outname = merge_exons ? "Avg_gene_scores.tsv" : "Avg_gene_scores_per_transcripts.tsv";
+
+    if (outname.empty()){
+        outname = merge_exons ? "Avg_gene_scores.tsv" : "Avg_gene_scores_per_transcripts.tsv";
+    }
 
     ofstream fh;
     fh.open(outname);
+
+    if (!fh.is_open()){
+        cerr << "Failed to create output file\n. Permission denied? Full Disk?\n";
+        exit(1);
+    }
 
     fh << "#GeneID\tGeneName\tTranscriptID\tNumSites\tAvgScore\n";
 
@@ -811,13 +819,13 @@ write_output(unordered_map<string, vector<Gene *>> &genome, bool const merge_exo
 
 void
 help(){
-    cerr << "Usage: ./calc_gene_avg_pixy -t pixy_table -a ann.gtf.gz --pop1 POP1 --pop2 POP2 --merge [optional] --coding [optional]\n";
+    cerr << "Usage: ./calc_gene_avg_pixy -t pixy_table -a ann.gtf.gz --pop1 POP1 --pop2 POP2 --merge [optional] --coding [optional] --out [optional]\n";
     exit(1);
 }
 
 int main(int argc, char *argv[]){
 
-    string table, ann, pop1, pop2;
+    string table, ann, pop1, pop2, outname, arg;
     bool merge_exons = false, coding = false;
     
     // expect at least 4 inputs
@@ -826,18 +834,21 @@ int main(int argc, char *argv[]){
     }
 
     for (int i = 1; i < argc; i++){
-        string arg = argv[i];
+        arg = argv[i];
         if (arg == "-t" && i + 1 < argc){
-            table = string(argv[i + 1]);
+            table = argv[i + 1];
         }
         else if (arg == "-a" && i + 1 < argc){
-            ann = string(argv[i + 1]);
+            ann = argv[i + 1];
         }
         else if (arg == "--pop1" && i + 1 < argc){
-            pop1 = string(argv[i + 1]);
+            pop1 = argv[i + 1];
         }
         else if (arg == "--pop2" && i + 1 < argc){
-            pop2 = string(argv[i + 1]);
+            pop2 = argv[i + 1];
+        }
+        else if (arg == "--out" && i + 1 < argc){
+            outname = argv[i + 1];
         }
         else if (arg == "--merge"){
             merge_exons = true;
@@ -882,7 +893,7 @@ int main(int argc, char *argv[]){
     overlap_genes(genome, markers);
 
     // write the output
-    write_output(genome, merge_exons);
+    write_output(genome, merge_exons, outname);
 
     return 0;
 }

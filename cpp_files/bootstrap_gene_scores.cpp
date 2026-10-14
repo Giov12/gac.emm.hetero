@@ -307,14 +307,14 @@ bootstrap(vector<Gene> &genes, const uint bootstraps, const uint threads, const 
 }
 
 int
-write_output(vector<Gene> &genes){
+write_output(vector<Gene> &genes, string &outname){
  
     //
     // write a simple 3-column tsv
     // where gene ID, score, pvalue
     //
 
-    string outname = "Gene_pvalues.tsv";
+    outname = outname.empty() ? "Gene_pvalues.tsv" : outname;
     ofstream fh(outname);
 
     if (!fh.is_open()){
@@ -375,13 +375,13 @@ create_uint(const char *arg, const uint n){
 
 void
 help(){
-    cerr << "Usage: ./bootstrap_gene_scores -f Avg_gene_scores.tsv --bootstraps INT [default: 10000] --threads INT [default 1] --seed INT [default 1234] --transcripts [optional] --skip_nodata [optional]\n";
+    cerr << "Usage: ./bootstrap_gene_scores -f Avg_gene_scores.tsv --bootstraps INT [default: 10000] --threads INT [default 1] --seed INT [default 1234] --transcripts [optional] --skip_nodata [optional] --out [optional]\n";
     exit(1);
 }
 
 int main(int argc, char *argv[]){
 
-    string infile;
+    string infile, outfile, arg;
     uint bootstraps       = 10000;
     uint threads          = 1;
     uint seed             = 1234;
@@ -394,9 +394,12 @@ int main(int argc, char *argv[]){
     }
 
     for (int i = 1; i < argc; i++){
-        string arg = argv[i];
+        arg = argv[i];
         if (arg == "-f" && i + 1 < argc){
             infile = argv[i + 1];
+        }
+        else if (arg == "--out" && i + 1 < argc){
+            outfile = argv[i + 1];
         }
         else if (arg == "--transcripts"){
             transcript_level = true;
@@ -454,7 +457,7 @@ int main(int argc, char *argv[]){
     bootstrap(genes, bootstraps, threads, seed);
 
     // write the output
-    write_output(genes);
+    write_output(genes, outfile);
     
     return 0;
 }
