@@ -18,6 +18,7 @@ minVar  = 2
 targets = set()
 genes   = defaultdict(list) # chrom -> [Gene class]
 samples = dict()            # sample  -> Sample
+annPCA  = False             # annotate the PCA plot with the sample's id
 
 class Sample:
 
@@ -88,7 +89,7 @@ class Gene:
 def parse_command_line() -> int:
     """helper function to get the user's arguments to ensure a proper start"""
 
-    global outdir, ann, popFile, vcf, tarFile, minVar
+    global outdir, ann, popFile, vcf, tarFile, minVar, annPCA
     
     desc  = "Generate a gene-specific PCA for the target genes using only exonic variants"
     ahelp = "Gene annotation file in GFF3/GTF format"
@@ -97,6 +98,7 @@ def parse_command_line() -> int:
     shelp = "Four column tsv file containing sample and hex value for PCA color point, population ID, and sex [M/F]"
     vhelp = "Vcf file containing samples found in --samples"
     mhelp = "Minimum number of variant sites required per gene"
+    lhelp = "If set, label each point in the PCA with sample IDs"
     
     parser = argparse.ArgumentParser(description=desc)
     parser.add_argument("-s", "--samples", required=True,  type=str, help=shelp)
@@ -105,6 +107,7 @@ def parse_command_line() -> int:
     parser.add_argument("-a", "--ann",     required=True,  type=str, help=ahelp)
     parser.add_argument("-o", "--outdir",  default=outdir, type=str, help=ohelp)
     parser.add_argument("-m", "--min",     default=minVar, type=int, help=mhelp)
+    parser.add_argument("-l", "--label",   action="store_true", help=lhelp)
 
     args = parser.parse_args()
     assert os.path.isfile(args.samples), f"Could not find {args.samples}"
@@ -120,6 +123,7 @@ def parse_command_line() -> int:
     ann     = args.ann
     outdir  = args.outdir.rstrip('/')
     minVar  = args.min
+    annPCA  = args.label
 
     return 0
 
@@ -455,7 +459,7 @@ def run_pca(gene: Gene, samples_ls: list[str]) -> tuple[np.ndarray, np.ndarray, 
 def plot_pca(gene: Gene, samples_ls: list[str], scores: np.ndarray, var: np.ndarray, nsites: int) -> int:
     """scatter plot of PC1 and PC2 colored by the user's sample colors"""
 
-    global samples, outdir
+    global samples, outdir, annPCA
 
     # create the colors and legends features
     colors = list()
@@ -502,6 +506,11 @@ def plot_pca(gene: Gene, samples_ls: list[str], scores: np.ndarray, var: np.ndar
     ax.set_ylabel(f"PC2 ({var[1] * 100:.1f}%)")
     ax.set_title(f"{gene.id} ({nsites} variable exonic sites)")
     ax.legend(handles = handles, frameon = False, loc = "center left", bbox_to_anchor = (1.02, 0.5))
+
+    if (annPCA):
+        for i, sample in enumerate(samples_ls):
+            ax.annotate(sample, (scores[i, 0], scores[i, 1]), xytext = (4, 4),
+                        textcoords = "offset points", fontsize = 6)
 
     fig.savefig(outpath, dpi = 300, bbox_inches = "tight")
     plt.close(fig)
