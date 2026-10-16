@@ -4,17 +4,15 @@ import argparse
 import os
 import sys
 import glob
-import math
 
 class Gene:
-    __slots__ = ("id", "name", "pval"
-                 "nperm", "nle", "emp", "fdr")
-    def __init__(self, id: str, name: str, pval: float) -> None:
+    __slots__ = ("id", "name", "score", "nperm", "nge", "emp", "fdr")
+    def __init__(self, id: str, name: str, score: float) -> None:
         self.id    = id
         self.name  = name
-        self.pval  = pval
-        self.nperm = 0     # permutations in which this gene had a p-value
-        self.nle   = 0     # permutations with a p-value <= the observed p-value
+        self.score = score
+        self.nperm = 0     # permutations in which this gene had a score
+        self.nge   = 0     # permutations with a score >= the observed score
         self.emp   = 1.0   # empirical (permutation) p-value
         self.fdr   = 1.0   # Benjamini-Hochberg corrected p-value
 
@@ -31,7 +29,7 @@ def get_arguments() -> int:
     # help messages & description
     desc  = "FDR correct each gene's observed P-value using precomputed permutations"
     phelp = "Path to directory containing permutated results"
-    Ohelp = "Tsv file containing the observed p-values for each gene"
+    Ohelp = "Tsv file containing the observed scores for each gene"
     ohelp = "name of output [optional]"
 
     parser = argparse.ArgumentParser(description=desc)
@@ -50,7 +48,7 @@ def get_arguments() -> int:
     return 0
 
 def load_genes() -> int:
-    """load in the observed genes and their p-values"""
+    """load in the observed genes and their scores"""
 
     global genes, obsfile
 
@@ -68,8 +66,8 @@ def load_genes() -> int:
         assert len(fields) == 5, f"Expected 5 columns in {obsfile}. Offending line:\n{line}"
         gene_id = fields[0]
         name    = fields[1] 
-        pval    = float(fields[4].strip())
-        genes[gene_id] = Gene(gene_id, name, pval)
+        score   = float(fields[4].strip())
+        genes[gene_id] = Gene(gene_id, name, score)
 
     fh.close()
 
@@ -99,7 +97,7 @@ def get_perm_files() -> list[str]:
     return perm_files
 
 def load_permutations() -> int:
-    """add the gene p-values into each gene object"""
+    """add the gene scores into each gene object"""
 
     global genes
 
@@ -116,26 +114,26 @@ def load_permutations() -> int:
             gene_id = fields[0]
             if (gene_id not in genes):
                 continue
-            pval = float(fields[4].strip())
+            score = float(fields[4].strip())
             genes[gene_id].nperm += 1
-            if (pval <= genes[gene_id].pval):
-                genes[gene_id].nle += 1
+            if (score >= genes[gene_id].score):
+                genes[gene_id].nge += 1
 
         fh.close()
 
     return 0
 
 def calc_fdr() -> int:
-    """correct each gene's pval after multiple testing"""
+    """assign a corrected p-value each gene's after multiple testing"""
 
     global outfile, genes
 
-    # step one, claculate empirical p-values
+    # step one, claculate empirical p-value
     tested = list()
     for gene in genes.values():
         if (gene.nperm == 0):
             continue # not in the permutation 
-        gene.emp = (gene.nle + 1) / (gene.nperm + 1)
+        gene.emp = (gene.nge + 1) / (gene.nperm + 1)
         tested.append(gene)
 
     if (len(tested) == 0):
@@ -154,10 +152,10 @@ def calc_fdr() -> int:
 
     # write the results
     ofh = open(outfile, 'w')
-    ofh.write("#GeneID\tGeneName\tCorrected Pval\n")
+    ofh.write("#GeneID\tGeneName\tObsScore\tNumPerms\tNumAsExtreme\tEmpPval\tFDR\n")
 
     for gene in tested:
-        ofh.write(f"{gene.id}\t{gene.name}\t{gene.pval}\t{gene.nperm}\t{gene.nle}\t{gene.emp:.6g}\t{gene.fdr:.6g}\n")
+        ofh.write(f"{gene.id}\t{gene.name}\t{gene.score}\t{gene.nperm}\t{gene.nge}\t{gene.emp:.6g}\t{gene.fdr:.6g}\n")
  
     ofh.close()
 
