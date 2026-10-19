@@ -10,10 +10,12 @@ from matplotlib.lines import Line2D
 
 region  = ''
 vcf     = ''
+ann     = ''
 popFile = ''     # 4 column file of [sample][color][pop][sex]
 minVar  = 2      # minimum variants
 samples = dict() # sample  -> Sample
 annPCA  = False  # annotate the PCA plot with the sample's id
+useAnn  = False  # use only exonic positions in the region
 
 class Sample:
 
@@ -29,19 +31,21 @@ class Sample:
 def parse_command_line() -> int:
     """helper function to get the user's arguments to ensure a proper start"""
 
-    global minVar, region, vcf, popFile, annPCA
+    global minVar, region, vcf, popFile, annPCA, ann, useAnn
     
     desc  = "Generate a local PCA using variants within a specific region"
     shelp = "Four column tsv file containing sample and hex value for PCA color point, population ID, and sex [M/F]"
     vhelp = "Vcf file containing samples found in --samples"
     rhelp = "region to plot. Format expected CHR:Start-END"
+    ahelp = "Gene annotation file in GFF3/GTF format [optional for only exonic positions]"
     mhelp = "Minimum number of variant sites required"
     lhelp = "If set, label each point in the PCA with sample IDs"
     
     parser = argparse.ArgumentParser(description=desc)
     parser.add_argument("-s", "--samples", required=True,  type=str, help=shelp)
     parser.add_argument("-v", "--vcf",     required=True,  type=str, help=vhelp)
-    parser.add_argument("-r", "--region",  required=True, type=str, help=rhelp)
+    parser.add_argument("-r", "--region",  required=True,  type=str, help=rhelp)
+    parser.add_argument("-a", "--ann",     default=ann,    type=str, help=ahelp)
     parser.add_argument("-m", "--min",     default=minVar, type=int, help=mhelp)
     parser.add_argument("-l", "--label",   action="store_true", help=lhelp)
 
@@ -51,6 +55,11 @@ def parse_command_line() -> int:
     assert ':' in args.region,           f"Region expected format: CHR:Start-END"
     assert args.min > 1,                 f"--min must be at least 2"
 
+    if (args.ann != ''):
+        assert os.path.isfile(args.ann), f"Could not find {args.ann}"
+        useAnn = True
+        ann    = args.ann
+
     popFile = args.samples
     vcf     = args.vcf
     region  = args.region
@@ -58,7 +67,6 @@ def parse_command_line() -> int:
     annPCA  = args.label
 
     return 0
-
 
 def load_samples() -> int:
     """load each sample and their color in the pca plots"""
@@ -113,10 +121,69 @@ def parse_region() -> tuple[str, int, int]:
 
     return (chrom, left, right)
 
+def parse_ann() -> list[tuple[int, int]]:
+    """return a list of pairs of exonic positions"""
+
+    global useAnn, ann
+
+    exons      = list()
+    fh         = gzip.open(ann, "rt") if ann.endswith(".gz") else open(ann, 'r')
+    target_reg = parse_region()
+    target_chr = target_reg[0] + '\t'
+    left       = target_reg[1]
+    right      = target_reg[2]
+
+    for line in fh:
+        if (len(line) == 0 or line.startswith(target_chr) == False):
+            continue
+        fields = line.split('\t')
+        if (fields[2] != "exon"):
+            continue
+        leftbp  = int(fields[3])
+        rightbp = int(fields[4])
+
+        if (rightbp < left or leftbp > right):
+            continue # no overlap
+
+        # clip to the specified region
+        leftbp = max(leftbp, left)
+        rightbp = min(rightbp, right)
+        exons.append((leftbp, rightbp))
+
+    fh.close()
+
+    if (len(exons) == 0):
+        sys.exit(f"No exonic regions found within the specified region")
+
+    print(f"Total exons found: {len(exons)}")
+    exons.sort()
+
+    return exons
+
+def is_exonic(exons: list[tuple[int, int]], pos: int) -> bool:
+    """binary search to see if this position is within an exon"""
+
+    left  = 0
+    right = len(exons) -1
+
+    while (left <= right):
+        mid   = (left + right) // 2
+        exon  = exons[mid]
+        start = exon[0]
+        end   = exon[1]
+
+        if (pos < start):
+            right = mid - 1 # position is before this exon
+        elif (pos > end):
+            left = mid + 1 # position is after this exon
+        else:
+            return True # it overlaps
+    return False
+
 def parse_vcf() -> int:
     """go through the vcf and find exonic variants for the target genes"""
 
-    global vcf, samples
+    global vcf, samples, useAnn
 
     samples_ls = list()
     target_reg = parse_region()
@@ -127,6 +194,10 @@ def parse_vcf() -> int:
     fh          = gzip.open(vcf, "rt") if vcf.endswith(".gz") else open(vcf, 'r')
     genomap     =  {"0/0": 0, "0/1": 1, "1/0": 1, "1/1": 2,
                     "0|0": 0, "0|1": 1, "1|0": 1, "1|1": 2}
+
+    # only exonic sites?
+    if (useAnn):
+        exons = parse_ann()
 
     for line in fh:
         if (len(line) == 0):
@@ -152,6 +223,9 @@ def parse_vcf() -> int:
         
         if ((left <= pos <= right) == False):
             continue # different part of the target chromosome
+        elif (useAnn):
+            if (is_exonic(exons, pos) == False):
+                continue
 
         sites  += 1
         # add each sample's genotype to each gene
@@ -189,7 +263,7 @@ def parse_vcf() -> int:
 def plot_pca(samples_ls: list[str], scores: np.ndarray, var: np.ndarray, nsites: int) -> int:
     """scatter plot of PC1 and PC2 colored by the user's sample colors"""
 
-    global samples, region, annPCA
+    global samples, region, annPCA, useAnn
 
     # create the colors and legends features
     colors = list()
@@ -229,9 +303,10 @@ def plot_pca(samples_ls: list[str], scores: np.ndarray, var: np.ndarray, nsites:
         if (mask.any()):
             ax.scatter(scores[mask, 0], scores[mask, 1], c = colors_np[mask].tolist(), s = 35,
                        marker = shape, edgecolors = "black", linewidths = 0.5)
+    t = " exonic " if useAnn else ' '
     ax.set_xlabel(f"PC1 ({var[0] * 100:.1f}%)")
     ax.set_ylabel(f"PC2 ({var[1] * 100:.1f}%)")
-    ax.set_title(f"{region}: ({nsites} variable sites)")
+    ax.set_title(f"{region}: ({nsites}{t}variable sites)")
     ax.legend(handles = handles, frameon = False, loc = "center left", bbox_to_anchor = (1.02, 0.5))
 
     if (annPCA):
