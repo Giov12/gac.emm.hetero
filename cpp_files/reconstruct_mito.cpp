@@ -19,6 +19,7 @@ using std::ofstream;
 using std::cout;
 using std::cerr;
 using std::stoi;
+using std::sort;
 using std::isdigit;
 using std::uint8_t;
 using std::find;
@@ -43,8 +44,6 @@ const uint   READ_OVERLAP = 50;   // dist in bp between two alignments from the 
 struct Align {
     string ref_id;
     string cigar;
-    string seq;
-    string qual;
     uint   pos;
     uint   ref_start;
     uint   ref_end;
@@ -78,7 +77,7 @@ struct Reconstruction {
     uint   naligns   = 0;
     uint   start_ref = 0;
     uint   cut       = 0; // position where read was rotated
-    uint   junction  = 0; // read bases where two alignments wrapped (< 0 == overlap)
+    int    junction  = 0; // read bases where two alignments wrapped (< 0 == overlap)
     uint   trim_head = 0; // unaligned bases drop from start of read
     uint   trim_tail = 0; // unaligned bases drop from end of read
     uint   nm        = 0; // edit distance reported by bam file
@@ -203,7 +202,7 @@ private:
 
         sort(order.begin(), order.end(), [&alns](uint a, uint b){
             uint len_a = alns[a].read_end - alns[a].read_start;
-            uint len_b = alns[b].read_end = alns[b].read_start;
+            uint len_b = alns[b].read_end - alns[b].read_start;
             return len_a != len_b ? len_a > len_b : a < b; // same length pick first
             }
         );
@@ -221,7 +220,7 @@ private:
                 int start   = cand.read_start > used.read_start ? cand.read_start : used.read_start;
                 int overlap = end - start;
                 
-                if (overlap >= READ_OVERLAP){
+                if (overlap >= static_cast<int>(READ_OVERLAP)){
                     keep = false;
                     break;
                 }
@@ -268,7 +267,7 @@ private:
                 wrap_idx = i;
             }
             else {
-                return "discountinuous"; // the dist b/t alignments exceeded the threshold
+                return "discontinuous"; // the dist b/t alignments exceeded the threshold
             }
         }
 
@@ -373,6 +372,7 @@ public:
     string name, seq, quality;
     uint   size;
     char   direction;
+    vector<string> fail_reasons; // why this read couldn't form a complete mt genome
 
 
     Read(string &n){
@@ -409,7 +409,7 @@ public:
         return this->_count;
     }
 
-    void reconstruct(void){
+    void reconstruct(unordered_map<string, uint> &lengths){
         //
         // step 1: bin each alignment to their reference alignment
         //
@@ -431,9 +431,47 @@ public:
         //         attempt to build a mito genome out of it
         //
 
+        string reason;
+        uint  ref_len;
         for (auto itr = _mappings.begin(); itr != _mappings.end(); itr++){
+            ref_len = lengths[itr->first];
+            
+            // forward direction
+            reason  = this->_build(itr->first, 'F', itr->second.fwd_alignments, ref_len);
+            
+            // this failed for some reason
+            if (!reason.empty()){
+                this->fail_reasons.push_back(reason);
+            }
 
-        }
+            reason = this->_build(itr->first, 'R', itr->second.rev_alignments, ref_len);
+
+            if (!reason.empty()){
+                this->fail_reasons.push_back(reason);
+            }
+        } // end of itr
+
+        //
+        // step 3: best explanation first
+        //
+        sort(this->_reconstructions.begin(), this->_reconstructions.end(), 
+            [](const Reconstruction &a, const Reconstruction &b){
+                // least mismatches with ref
+                if (a.nm != b.nm){
+                    return a.nm < b.nm;
+                }
+                // which rec covered the mtgenome the most
+                else if (a.coverage != b.coverage){
+                    return a.coverage > b.coverage;
+                }
+                // sort by alphabetical order
+                else if (a.ref_id != b.ref_id){
+                    return a.ref_id < b.ref_id;
+                }
+                // return F first if all things are equal
+                return a.direction < b.direction;
+            }
+        );
 
     }
 
@@ -582,7 +620,7 @@ get_sequence_length(const string &cigar){
             p++;
         }
         else{
-            if (c != 'D'){
+            if (c == 'M' || c == 'I' || c == 'S' || c == 'H' || c == '=' || c == 'X'){
                 cur_str = cigar.substr(last_p, p - last_p);
                 size   += stoi(cur_str);
             }
@@ -684,7 +722,6 @@ verify(const string &bamfile, const vector<string> &targets, unordered_map<strin
     }
 
     return 0;
-
 }
 
 int
@@ -725,7 +762,6 @@ collect_alignments(const string &bamfile, vector<Read> &mappings, const vector<s
             string name   = parts[0];
             aln.cigar     = parts[5];
             aln.ref_id    = parts[2];
-            aln.qual      = parts[10];
             aln.direction = reverse_strand(parts[1]) ? 'R' : 'F';
             aln.pos       = static_cast<uint>(stoi(parts[3]));
             uint idx      = mappings.size();
@@ -790,21 +826,23 @@ collect_alignments(const string &bamfile, vector<Read> &mappings, const vector<s
 }
 
 int 
-write_mappings(vector<Read> &mappings){
-
-    //
-    // TODO: This function is incomplete
-    // fill finish once reconstruction logic is finished
-    //
+write_mappings(vector<Read> &mappings, unordered_map<string, uint> &lengths){
 
     //
     // create the output stream to construct the file
     // containing all the possible full reconstructions
+    // in both a tsv file that contains details of the constructions
+    // along with a constructed fastq file
     //
+
     ofstream ofh("Reconstruct_Sequences.tsv");
     ofstream fqfh("Reconstruct_Sequences.fastq");
 
-    uint failed = 0, algn_count;
+    uint failed = 0, written = 0;
+    unordered_map<string, uint> reasons;
+
+    ofh << "#Read\tRef\tStrand\tRead_length\tN_Alignments\tCoverage\tWraps\t"
+        << "Start_Ref\tCut\tJunction\tTrim_Head\tTrim_Tail\tLength\tnm\n";
 
 
     for (int i = 0; i < mappings.size(); i++){
@@ -812,21 +850,49 @@ write_mappings(vector<Read> &mappings){
         // try to reconstruct the scaffold based on its
         // alignments
         //
-        mappings[i].reconstruct();
+        mappings[i].reconstruct(lengths);
 
         if (!mappings[i].has_reconstructions()){
             failed++;
-            continue; // was too fragmented
+            // increment the number of reasons
+            for (uint j = 0; j < mappings[i].fail_reasons.size(); j++){
+                reasons[mappings[i].fail_reasons[j]]++;
+            }
+            continue; 
         }
 
         vector<Reconstruction> &reconstructions = mappings[i].get_reconstructions();
+        uint                           read_len = mappings[i].size;
 
+        for (uint j = 0; j < reconstructions.size(); j++){
+            Reconstruction &rec = reconstructions[j];
+            char         strand = rec.direction == 'F' ? '+' : '-';
+            string        wraps = rec.wraps ? "Yes" : "No";
+
+            ofh << rec.name       << '\t' << rec.ref_id    << '\t' << strand        << '\t'
+                << read_len       << '\t' << rec.naligns   << '\t' << rec.coverage  << '\t'
+                << wraps          << '\t' << rec.start_ref << '\t' << rec.cut       << '\t'
+                << rec.junction   << '\t' << rec.trim_head << '\t' << rec.trim_tail << '\t'
+                << rec.seq.size() << '\t' << rec.nm        << '\n';
+        } // end of j
+
+        Reconstruction &best = reconstructions.front();
+
+        fqfh << '@' << best.name << " ref=" << best.ref_id << " start=" 
+             << best.start_ref   << '\n'   << best.seq     << "\n+\n" 
+             << best.qua         << '\n';
+        written++;
     }
 
     ofh.close();
     fqfh.close();
 
-    cerr << failed << " out of " << mappings.size() << " scaffolds failed to reconstruct\n";
+    cerr << "Wrote " << written  << " reads\n";
+    cerr << failed << " out of " << mappings.size() << " reads failed to reconstruct to a mitogenome\n";
+
+    for (auto itr = reasons.begin(); itr != reasons.end(); itr++){
+        cerr << '\t' << itr->first << ": " << itr->second << '\n';
+    }
 
     return 0;
 }
@@ -856,7 +922,6 @@ main(int argc, char *args[]){
         else if (arg == "-h"){
             help();
         }
-
     }
 
     if (bamfile.empty()){
@@ -903,9 +968,11 @@ main(int argc, char *args[]){
     collect_alignments(bamfile, mappings, targets);
 
     //
-    // step 2: write these out to a file
+    // step 3/4: right before writing the collected records
+    //           reconstruct a sequence based on its mtgenome
+    //           so that it best resembles the target mtgenomes
     //
-    write_mappings(mappings);
+    write_mappings(mappings, lengths);
 
     return 0;
 }
