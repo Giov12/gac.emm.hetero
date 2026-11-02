@@ -8,6 +8,7 @@
 #include <cstdio>
 #include <cctype>
 #include <cstdint>
+#include <utility>
 
 using std::string;
 using std::unordered_map;
@@ -21,6 +22,7 @@ using std::stoi;
 using std::isdigit;
 using std::uint8_t;
 using std::find;
+using std::pair;
 
 //
 // parse a bam file to find read alignments that can be circularized to represent the
@@ -29,14 +31,29 @@ using std::find;
 
 typedef unsigned int uint;
 
+//
+// Current thresholds used to decided whether a read represents a full mito genome
+// TODO: make these command line arguments
+//
+const double MIN_COVERAGE = 0.90; // fraction of the ref the alignments must cover
+const double MAX_SPAN     = 1.5;  // aligned bases / ref length ; fraction of read covering ref (includes wrapping)
+const uint   MAX_DIST     = 50;   // dist in bp between two alignments from the same read from the ref's perspective
+const uint   READ_OVERLAP = 50;   // dist in bp between two alignments from the same read from the read's perspective
+
 struct Align {
     string ref_id;
     string cigar;
     string seq;
     string qual;
     uint   pos;
+    uint   ref_start;
+    uint   ref_end;
+    uint   read_start;
+    uint   read_end;
     char   direction;
-    uint8_t id; // id for the alingment, not the read
+    bool   hard_clipped;
+    uint    nm; // edit distance from bam file
+    uint8_t id; // id for the alingment, not the read  
 };
 
 struct Part {
@@ -55,25 +72,312 @@ struct Reconstruction {
     string name;
     string seq;
     string qua;
+    string ref_id;
+    char   direction = 'F';
+    bool   wraps     = false;
+    uint   naligns   = 0;
+    uint   start_ref = 0;
+    uint   cut       = 0; // position where read was rotated
+    uint   junction  = 0; // read bases where two alignments wrapped (< 0 == overlap)
+    uint   trim_head = 0; // unaligned bases drop from start of read
+    uint   trim_tail = 0; // unaligned bases drop from end of read
+    uint   nm        = 0; // edit distance reported by bam file
+    double coverage  = 0; // fraction of the ref covered
 
 };
 
-
 class Read {
-
 private:
     vector<Align>          _aligns; // hold onto each alignment
     vector<Reconstruction> _reconstructions; // contains only alignments that can represent an entire mt
     uint8_t               _count = 0;
 
+    struct _organizer {
+        vector<Align> fwd_alignments;
+        vector<Align> rev_alignments;
+    };
+
+    string _reverse_complement(const string &seq){
+        //
+        // return the reverse compliment of this sequence
+        //
+
+        const uint n = seq.size();
+        string rc(n, 'N'); // string of size n full of N's
+
+        for (uint i = 0; i < n; i++){
+            switch (seq[n - i - 1]) {
+                case 'A':
+                    rc[i] = 'T';
+                    break;
+                case 'C':
+                    rc[i] = 'G';
+                    break;
+                case 'G':
+                    rc[i] = 'C';
+                    break;
+                case 'T':
+                    rc[i] = 'A';
+                    break;
+                case 'a':
+                    rc[i] = 'T';
+                    break;
+                case 'c':
+                    rc[i] = 'G';
+                    break;
+                case 'g':
+                    rc[i] = 'C';
+                    break;
+                case 't':
+                    rc[i] = 'A';
+                    break;
+                default:
+                    rc[i] = 'N'; // unknown char
+                    break;
+            }
+        }
+
+        return rc;
+    }
+
+    uint _covered_bases(vector<pair<uint, uint>> &spans){
+        
+        //
+        // count the number of references bases coverd by intervals
+        // following half open [start, end) where end is not included
+        //
+
+        if (spans.empty()){
+            return 0;
+        }
+
+        sort(spans.begin(), spans.end());
+
+        uint total     = 0;
+        uint cur_start = spans[0].first;
+        uint cur_end   = spans[0].second;
+
+        for (uint i = 1; i < spans.size(); i++){
+            if (spans[i].first > cur_end){
+                //
+                // jump to the next interval
+                //
+                total    += cur_end - cur_start;
+                cur_start = spans[i].first;
+                cur_end   = spans[i].second;
+            }
+            else if (spans[i].second > cur_end){
+                cur_end = spans[i].second; 
+            }
+        }
+
+        total += cur_end - cur_start;
+
+        return total;
+    }
+
+    string _build(const string &ref_id, char direction, vector<Align> &alns, uint &ref_len){
+
+        //
+        // attempt to build a mito genome using these sets of alignments
+        // returns a string that best guesses the reason why it failed
+        //
+
+        if (alns.empty()){
+            return "";
+        }
+        else if (!this->has_seq()){
+            // edge case (very unlikely) where all records are hard clipped
+            return "no_sequence"; 
+        }
+
+        //
+        // step 1: set the alignment order and avoid adding
+        //         alignments that cover the same range
+        //
+        vector<uint> order(alns.size()), chain;
+
+        for (uint i = 0; i < order.size(); i++){
+            order[i] = i;
+        }
+
+        sort(order.begin(), order.end(), [&alns](uint a, uint b){
+            uint len_a = alns[a].read_end - alns[a].read_start;
+            uint len_b = alns[b].read_end = alns[b].read_start;
+            return len_a != len_b ? len_a > len_b : a < b; // same length pick first
+            }
+        );
+
+        //
+        // now create the starting chain
+        //
+        for (uint i = 0; i < order.size(); i++){
+            const Align &cand = alns[order[i]];
+            bool keep         = true;
+
+            for (uint j = 0; j < chain.size(); j++){
+                const Align &used = alns[chain[j]];
+                int end     = cand.read_end < used.read_end ? cand.read_end : used.read_end;
+                int start   = cand.read_start > used.read_start ? cand.read_start : used.read_start;
+                int overlap = end - start;
+                
+                if (overlap >= READ_OVERLAP){
+                    keep = false;
+                    break;
+                }
+            } // end of j
+            
+            if (keep){
+                chain.push_back(order[i]);
+            }
+        } // end of i
+
+        //
+        // now sort the chain based on where the read starts
+        //
+        sort(chain.begin(), chain.end(), [&alns](uint a, uint b){
+                if (alns[a].read_start != alns[b].read_start){
+                    return alns[a].read_start < alns[b].read_start;
+                }
+                return alns[a].read_end < alns[b].read_end;
+            }
+        );
+
+        //
+        // step 2: walk along the read. Each alignment has to pick up where the last one
+        //         stopped on the reference, or once, jump from the end of the reference
+        //         to the beginning
+        //
+        uint wraps = 0, wrap_idx = 0; // idx in chain of the alignment right after wrap
+
+        for (uint i = 1; i < chain.size(); i++){
+            const Align &prev = alns[chain[i - 1]];
+            const Align &next = alns[chain[i]];
+            int          dist = next.ref_start - prev.ref_end;
+
+            if (dist < 0){
+                dist *= -1;
+            }
+    
+            if (dist <= MAX_DIST){
+                continue; // continous
+            }
+
+            if (prev.ref_end + MAX_DIST >= ref_len && next.ref_start <= MAX_DIST){
+                wraps++;
+                wrap_idx = i;
+            }
+            else {
+                return "discountinuous"; // the dist b/t alignments exceeded the threshold
+            }
+        }
+
+        if (wraps > 1){
+            return "multiple_wraps"; // this read went >=2 around the mitochondria
+        }
+
+        //
+        // step 3: is enough the reference covered
+        //
+
+        vector<pair<uint, uint>> spans;
+        uint nm = 0, span = 0;
+
+        for (uint i = 0; i < chain.size(); i++){
+            const Align &aln = alns[chain[i]];
+            spans.push_back(std::make_pair(aln.ref_start, aln.ref_end));
+            nm += aln.nm;
+            span += aln.ref_end - aln.ref_start;
+        }
+
+        double cov = static_cast<double>(this->_covered_bases(spans)) / ref_len;
+        double spn = static_cast<double>(span) / ref_len;
+
+        if (cov < MIN_COVERAGE){
+            return "low_coverage";
+        }
+        else if (spn > MAX_SPAN){
+            return "too_long";
+        }
+
+        //
+        // step 4: put the read into the orientation of the ref
+        //
+
+        string oseq = this->seq, oqua = this->quality;
+
+        //
+        // the seq is in a different orientation from the
+        // one we are trying to build
+        //
+        if (this->direction != direction){
+            oseq = this->_reverse_complement(oseq);
+            oqua = string(oqua.rbegin(), oqua.rend());
+        }
+
+        uint head = alns[chain.front()].read_start;
+        uint tail = 0;
+
+        for (uint i = 0; i < chain.size(); i++){
+            tail = tail > alns[chain[i]].read_end ? tail : alns[chain[i]].read_end;
+        }
+
+        //
+        // edge case if we didn't parse this correctly or the records are weird
+        //
+        if (oseq.size() != this->size || oqua.size() != oseq.size() || tail > oseq.size()){
+            return "sequence_mismatch";
+        }
+
+        //
+        // step 5: rotate the sequence & quality scores. If wrapping was found, the
+        //         sequence starts where the alignment left of
+        //
+        Reconstruction rec;
+
+        rec.name      = this->name;
+        rec.ref_id    = ref_id;
+        rec.direction = direction;
+        rec.naligns   = chain.size();
+        rec.coverage  = cov;
+        rec.nm        = nm;
+        rec.trim_head = head;
+        rec.trim_tail = oseq.size() - tail;
+        rec.start_ref = alns[chain.front()].ref_start + 1;
+
+        uint cut = head;
+        if (wraps == 1){
+            const Align &before = alns[chain[wrap_idx - 1]];
+            const Align &after  = alns[chain[wrap_idx]];
+
+            // update
+            cut           = after.read_start;
+            rec.wraps     = true;
+            rec.junction  = static_cast<int>(after.read_start) - static_cast<int>(before.read_end);
+            rec.start_ref = after.ref_start + 1;
+        }
+
+        rec.cut = cut;
+        rec.seq = oseq.substr(cut, tail - cut) + oseq.substr(head, cut - head);
+        rec.qua = oqua.substr(cut, tail - cut) + oqua.substr(head, cut - head);
+
+        this->_reconstructions.push_back(rec);
+
+        return ""; // no reason, this worked
+
+    }
+
 
 public:
 
-    string name;
+    string name, seq, quality;
     uint   size;
+    char   direction;
+
 
     Read(string &n){
         this->name = n;
+        this->size = 0;
     }
 
     ~Read(void){
@@ -81,8 +385,23 @@ public:
         this->_reconstructions.clear();
     }
 
+    bool has_seq(void){
+        return !this->seq.empty();
+    }
+
     void add_align(Align &a){
         this->_aligns.emplace_back(a);
+    }
+
+    void set_seq(const string &seq, const string &quality, char direction){
+
+        if (this->has_seq()){
+            return; // sequence already added
+        }
+
+        this->seq       = seq;
+        this->quality   = quality;
+        this->direction = direction;
     }
 
     uint8_t get_count(void){
@@ -94,32 +413,27 @@ public:
         //
         // step 1: bin each alignment to their reference alignment
         //
-        vector<vector<Align>> _mappings;
+        unordered_map<string, _organizer> _mappings;
 
         for (uint i = 0; i < this->_aligns.size(); i++){
             Align &aln = this->_aligns[i];
-            bool added = false;
-            uint j     = 0 ;
-            for (; j < _mappings.size(); j++){
-                if (_mappings[j].front().ref_id == aln.ref_id){
-                    _mappings[j].push_back(aln);
-                    added = true;
-                    break;
-                }
+
+            if (aln.direction == 'F'){
+                _mappings[aln.ref_id].fwd_alignments.push_back(aln);
             }
-            if (!added){
-                _mappings.push_back(vector<Align>());
-                _mappings[j].push_back(aln);
+            else {
+                _mappings[aln.ref_id].rev_alignments.push_back(aln);
             }
         }
 
         //
-        // simple case: all alignments to a single reference
+        // step 2: iterate over all possible cases and
+        //         attempt to build a mito genome out of it
         //
 
-        //
-        // the mitochondria may have undergone recombination
-        //
+        for (auto itr = _mappings.begin(); itr != _mappings.end(); itr++){
+
+        }
 
     }
 
@@ -187,10 +501,60 @@ parse_tabular(string &line, vector<string> &parts){
     return 0;
 }
 
-bool
-file_exists(const string &path){
-    struct stat buffer;
-    return stat(path.c_str(), &buffer) == 0;
+int
+parse_cigar(Align &aln){
+    
+    //
+    // walk through each operation & get the coordinates
+    // both on the reference and the read
+    //
+
+    const string &cigar  = aln.cigar;
+    uint cur   = 0, prev = 0,     n = cigar.size();
+    uint lead  = 0, qlen = 0, rlen = 0;
+    bool algnd = false; // did we pass the leading clip
+
+    aln.hard_clipped = false; // until proven
+
+    while (cur < n){
+        char c = cigar[cur];
+        if (isdigit(c)){
+            cur++;
+        }
+        else {
+            uint len = stoi(cigar.substr(prev, cur - prev));
+            if (c == 'S' || c == 'H'){
+                if (!algnd){
+                    // leading clip, trailing clip is implied by the read length
+                    lead += len; 
+                }
+                if (c == 'H'){
+                    aln.hard_clipped = true;
+                }
+            }
+            else {
+                algnd = true;
+                //
+                // see https://samtools.github.io/hts-specs/SAMv1.pdf
+                //
+                if (c == 'M' || c == 'I' || c == '=' || c == 'X'){
+                    qlen += len; // consumes the read
+                }
+                if (c == 'M' || c == 'D' || c == 'N' || c == '=' || c == 'X'){
+                    rlen += len; // consumes the reference
+                }
+            }
+            prev = cur + 1;
+            cur++;
+        }
+    }
+
+    aln.read_start = lead;
+    aln.read_end   = lead + qlen;
+    aln.ref_start  = aln.pos - 1;
+    aln.ref_end    = aln.ref_start + rlen;
+
+    return 0;
 }
 
 bool
@@ -264,7 +628,7 @@ reverse_strand(const string &flag){
 }
 
 int
-verify(const string &bamfile, const vector<string> &targets){
+verify(const string &bamfile, const vector<string> &targets, unordered_map<string, uint> &lengths){
     //
     // helper function to determine whether the targets
     // were part of this alignment file to begin with
@@ -275,7 +639,7 @@ verify(const string &bamfile, const vector<string> &targets){
     FILE *fh   = popen(cmd.c_str(), "r");
     vector<string> parts;
     string line, region, ref;
-    size_t p;
+    uint ref_len;
     int c;
 
     //
@@ -285,15 +649,22 @@ verify(const string &bamfile, const vector<string> &targets){
         if (c == '\n'){
             parse_tabular(line, parts);
 
-            if (parts.empty()){
-                continue;
-            }
-            else if (parts.front()[0] != '@'){
-                region = parts[1];
-                p      = region.find_first_of(':');
-                ref    = region.substr(p + 1);
+            if (parts.size() > 1 && parts[0] == "@SQ"){
+                ref.clear();
+                ref_len = 0;
+
+                for (uint i = 1; i < parts.size(); i++){
+                    if (parts[i].compare(0, 3, "SN:") == 0){
+                        ref = parts[i].substr(3);
+                    }
+                    else if (parts[i].compare(0, 3, "LN:") == 0){
+                        ref_len = static_cast<uint>(stoi(parts[i].substr(3)));
+                    }
+                }
+
                 if (find(targets.begin(), targets.end(), ref) != targets.end()){
                     found++;
+                    lengths[ref] = ref_len;
                     if (found == targets.size()){
                         break; // done early
                     }
@@ -344,8 +715,9 @@ collect_alignments(const string &bamfile, vector<Read> &mappings, const vector<s
                 line.clear();
                 continue;
             }
-            ref = parts.front();
+            ref = parts[2];
             if (find(targets.begin(), targets.end(), ref) == targets.end()){
+                line.clear();
                 continue; // not a target chrom
             }
 
@@ -353,39 +725,59 @@ collect_alignments(const string &bamfile, vector<Read> &mappings, const vector<s
             string name   = parts[0];
             aln.cigar     = parts[5];
             aln.ref_id    = parts[2];
-            aln.seq       = parts[9];
             aln.qual      = parts[10];
             aln.direction = reverse_strand(parts[1]) ? 'R' : 'F';
             aln.pos       = static_cast<uint>(stoi(parts[3]));
-            for (int i = 0; i < mappings.size(); i++){
-                if (mappings[i].name == name){
-                    aln.id = mappings[i].get_count();
-                    mappings[i].add_align(aln);
-                    name.clear();
+            uint idx      = mappings.size();
 
-                    // check if we need to get the sequence length
-                    if (is_primary(parts[1])){
-                        mappings[i].size = get_sequence_length(aln.cigar);
-                    }
+            //
+            // parse the cigar & add the other attributes (e.g., ref_start)
+            //
+            parse_cigar(aln);
+
+            //
+            // check if the nm flag was set
+            //
+            aln.nm = 0;
+            for (uint i = 11; i < parts.size(); i++){
+                // equivalent to str.startswith()
+                if (parts[i].compare(0, 5, "NM:i:") == 0){
+                    aln.nm = static_cast<uint>(stoi(parts[i].substr(5)));
                     break;
                 }
             }
-            // did we not add this?
-            if (!name.empty()){
-                Read query(name);
-                aln.id = query.get_count();
-                query.add_align(aln);
-                if (is_primary(parts[1])){
-                    query.size = get_sequence_length(aln.cigar);
+
+            for (int i = 0; i < mappings.size(); i++){
+                if (mappings[i].name == name){
+                    idx = i;
+                    break;
                 }
-                mappings.push_back(query);
             }
-        parts.clear();
-        line.clear();
-    }
+            // it was not added
+            if (idx == mappings.size()){
+                mappings.emplace_back(name);
+            }
+            Read &query = mappings[idx];
+            aln.id      = query.get_count();
+
+             // set once
+            if (query.size == 0){ 
+                query.size = get_sequence_length(aln.cigar);  
+            }
+
+            if (!aln.hard_clipped && parts[9] != "*"){
+                //
+                // parts[9]  == query sequence
+                // parts[10] == query sequence quality scores
+                //
+                query.set_seq(parts[9], parts[10], aln.direction);
+            }
+            query.add_align(aln);
+            line.clear();
+        }
     else {
         line += static_cast<char>(c);
-    }
+        }
     }
     pclose(fh);
 
@@ -396,8 +788,6 @@ collect_alignments(const string &bamfile, vector<Read> &mappings, const vector<s
 
     return 0;
 }
-
-
 
 int 
 write_mappings(vector<Read> &mappings){
@@ -434,7 +824,7 @@ write_mappings(vector<Read> &mappings){
     }
 
     ofh.close();
-    fqfh.clear();
+    fqfh.close();
 
     cerr << failed << " out of " << mappings.size() << " scaffolds failed to reconstruct\n";
 
@@ -491,7 +881,9 @@ main(int argc, char *args[]){
     // step 1: collect the ids of the target reference mito genomes
     //
     vector<string> targets;
+    unordered_map<string, uint> lengths; // lengths of target
     parse_comma_delim(target_str, targets);
+
     if (targets.empty()){
         cerr << "Error: Unable to parse " << target_str << " for reference sequence IDs\n";
         exit(EXIT_FAILURE);
@@ -500,7 +892,8 @@ main(int argc, char *args[]){
         //
         // verify that the target IDs can be found in the bam file
         //
-        verify(bamfile, targets);
+
+        verify(bamfile, targets, lengths);
     }
 
     //
