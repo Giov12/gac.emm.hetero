@@ -36,7 +36,7 @@ typedef unsigned int uint;
 // Current thresholds used to decided whether a read represents a full mito genome
 // TODO: make these command line arguments
 //
-const double MIN_COVERAGE   = 0.90; // fraction of the ref the alignments must cover
+const double MIN_COVERAGE   = 0.70; // fraction of the ref the alignments must cover
 const double MAX_SPAN       = 1.5;  // aligned bases / ref length ; fraction of read covering ref (includes wrapping)
 const uint   MAX_DIST       = 50;   // dist in bp between two alignments from the same read from the ref's perspective
 const uint   READ_OVERLAP   = 50;   // dist in bp between two alignments from the same read from the read's perspective
@@ -908,6 +908,8 @@ verify(const string &bamfile, const vector<string> &targets, unordered_map<strin
     // were part of this alignment file to begin with
     //
 
+    cerr << "Verifying " << bamfile << '\n';
+
     uint found = 0;
     string cmd = "samtools view -H " + bamfile;
     FILE *fh   = popen(cmd.c_str(), "r");
@@ -956,6 +958,9 @@ verify(const string &bamfile, const vector<string> &targets, unordered_map<strin
         cerr << "Error: Not all the target IDs were found in the bam file\n";
         exit(EXIT_FAILURE);
     }
+    else {
+        cerr << "Found all target mt genomes in " << bamfile << '\n';
+    }
 
     return 0;
 }
@@ -969,6 +974,8 @@ collect_alignments(const string &bamfile, vector<Read> &mappings, const vector<s
     //
     string line, ref;
     vector<string> parts;
+
+    cerr << "Parsing " << bamfile << '\n';
 
     //
     // create a file stream
@@ -1056,6 +1063,9 @@ collect_alignments(const string &bamfile, vector<Read> &mappings, const vector<s
     if (mappings.empty()){
         cerr << "No alignments were found for the target sequences\n";
         exit(EXIT_FAILURE);
+    }
+    else {
+        cerr << "Found " << mappings.size() << " alignments mapped to target mito genomes\n";
     }
 
     return 0;
