@@ -36,11 +36,11 @@ typedef unsigned int uint;
 // Current thresholds used to decided whether a read represents a full mito genome
 // TODO: make these command line arguments
 //
-const double MIN_COVERAGE = 0.90; // fraction of the ref the alignments must cover
-const double MAX_SPAN     = 1.5;  // aligned bases / ref length ; fraction of read covering ref (includes wrapping)
-const uint   MAX_DIST     = 50;   // dist in bp between two alignments from the same read from the ref's perspective
-const uint   READ_OVERLAP = 50;   // dist in bp between two alignments from the same read from the read's perspective
-
+const double MIN_COVERAGE   = 0.90; // fraction of the ref the alignments must cover
+const double MAX_SPAN       = 1.5;  // aligned bases / ref length ; fraction of read covering ref (includes wrapping)
+const uint   MAX_DIST       = 50;   // dist in bp between two alignments from the same read from the ref's perspective
+const uint   READ_OVERLAP   = 50;   // dist in bp between two alignments from the same read from the read's perspective
+const uint   MAX_SPLIT_DIST = 150;  // dist in bp between two alignments on two different mtgenomes
 struct Align {
     string ref_id;
     string cigar;
@@ -55,23 +55,12 @@ struct Align {
     uint8_t id; // id for the alingment, not the read  
 };
 
-struct Part {
-    uint8_t id;
-    uint  start; // relative to the reference
-    uint  length;
-
-    //
-    // we need to define a constructor
-    //
-    Part(uint8_t id_, uint start_, uint length_) :
-        id(id_), start(start_), length(length_) {}
-};
-
 struct Reconstruction {
     string name;
     string seq;
     string qua;
     string ref_id;
+    string path;          // order of recombined mtgenome 
     char   direction = 'F';
     bool   wraps     = false;
     uint   naligns   = 0;
@@ -80,6 +69,7 @@ struct Reconstruction {
     int    junction  = 0; // read bases where two alignments wrapped (< 0 == overlap)
     uint   trim_head = 0; // unaligned bases drop from start of read
     uint   trim_tail = 0; // unaligned bases drop from end of read
+    uint   switches  = 0; // number of putative recombination points in a recombined mtgenome
     uint   nm        = 0; // edit distance reported by bam file
     double coverage  = 0; // fraction of the ref covered
 
@@ -255,7 +245,7 @@ private:
             int          dist = next.ref_start - prev.ref_end;
 
             if (dist < 0){
-                dist *= -1;
+                dist = -dist;
             }
     
             if (dist <= MAX_DIST){
@@ -366,6 +356,237 @@ private:
 
     }
 
+    string _build_split(char direction, unordered_map<string, uint> &lengths){
+
+        //
+        // attempt to build a mito genome from alignments that are split between
+        // mito genomes. Similar to _build(), return an explanatory string
+        //
+        // ASSUMPTION: the mitogenomes in the reference genome are in the same orientation
+        // 
+        //
+
+        vector<Align> alns;
+
+        for (uint i = 0; i < this->_aligns.size(); i++){
+            if (this->_aligns[i].direction == direction){
+                alns.push_back(this->_aligns[i]);
+            }
+        }
+
+        if (alns.empty()){
+            return ""; // no alignments in this orientation
+        }
+        else if (!this->has_seq()){
+            return "no_sequence"; // probably won't happen but safety first
+        }
+
+        //
+        // step 1: Choosing alignments. Since the mtgenomes are more similar than different,
+        //         the same part of the read can align to both mtgenomes. Need to rank by
+        //         a score (aligned bases - edit distance) to keep the genome that matches
+        //         better
+        //
+
+        vector<uint> order(alns.size()), chain;
+
+        for (uint i = 0; i < order.size(); i++){
+            order[i] = i;
+        }
+
+        sort(order.begin(), order.end(), [&alns](uint a, uint b){
+            int score_a = static_cast<int>(alns[a].read_end - alns[a].read_start) - static_cast<int>(alns[a].nm);
+            int score_b = static_cast<int>(alns[b].read_end - alns[b].read_start) - static_cast<int>(alns[b].nm);
+            return score_a != score_b ? score_a > score_b : a < b; // same score, which ever came first
+        });
+
+        for (uint i = 0; i < order.size(); i++){
+            const Align &cand = alns[order[i]];
+            bool keep         = true;
+
+            for (uint j = 0; j < chain.size(); j++){
+                const Align &used = alns[chain[j]];
+                int end           = cand.read_end < used.read_end ? cand.read_end : used.read_end;
+                int start         = cand.read_start > used.read_start ? cand.read_start : used.read_start;
+                int overlap       = end - start;
+
+                if (overlap >= static_cast<int>(READ_OVERLAP)){
+                    keep = false;
+                    break;
+                }
+            } // end of j
+            
+            if (keep){
+                chain.push_back(order[i]);
+            }
+        } // end of i
+
+        //
+        // now sort the chain based on where the read starts
+        //
+        sort(chain.begin(), chain.end(), [&alns](uint a, uint b){
+                if (alns[a].read_start != alns[b].read_start){
+                    return alns[a].read_start < alns[b].read_start;
+                }
+                return alns[a].read_end < alns[b].read_end;
+            });
+
+        //
+        // verify that there are alignments from >1 mtgenome
+        //
+        bool split = false;
+
+        for (uint i = 0; i < chain.size(); i++){
+            // comparing all to the front
+            if (alns[chain[i]].ref_id != alns[chain[0]].ref_id){
+                split = true;
+                break;
+            }
+        }
+
+        if (!split){
+            return "single_ref";
+        }
+
+        //
+        // step 2: walk along the read. Each alignment has to pick up where the last one
+        //         stopped, or once, jump from the end of a mito genome to the beginning.
+        //         The two alignments can be on different mt genomes
+        //
+        uint wraps = 0, wrap_idx = 0, switches = 0;
+
+        for (uint i = 1; i < chain.size(); i++){
+            const Align &prev = alns[chain[i - 1]];
+            const Align &next = alns[chain[i]];
+            int          dist = static_cast<int>(next.ref_start) - static_cast<int>(prev.ref_end);
+            bool         diff = prev.ref_id != next.ref_id; 
+
+            if (dist < 0){
+                dist = -dist;
+            }
+            if (diff){
+                switches++;
+            }
+            if (dist <= static_cast<int>(diff ? MAX_SPLIT_DIST : MAX_DIST)){
+                continue; // continuous
+            }
+
+            // judge the end by the end of the genome of the prev alignment
+            if (prev.ref_end + MAX_DIST >= lengths[prev.ref_id] && next.ref_start <= MAX_DIST){
+                wraps++;
+                wrap_idx = i;
+            }
+            else {
+                return "discontinuous";
+            }
+        } // end of i
+
+        if (wraps > 1){
+            return "multiple_wraps";
+        }
+
+        //
+        // step 3: Calculate coverage. Each mito genome contributes to the overall coverage
+        //         we will select the longest mt genome as the frame of reference
+        //
+        vector<pair<uint, uint>> spans;
+        uint nm = 0, span = 0, frame = 0;
+
+        for (uint i = 0; i < chain.size(); i++){
+            const Align &aln = alns[chain[i]];
+            uint     ref_len = lengths[aln.ref_id];
+
+            spans.push_back(std::make_pair(aln.ref_start, aln.ref_end));
+            nm   += aln.nm;
+            span += aln.ref_end - aln.ref_start;
+            frame = frame > ref_len ? frame : ref_len;
+        }
+
+        double cov = static_cast<double>(this->_covered_bases(spans)) / frame;
+        double spn = static_cast<double>(span) / frame;
+
+        if (cov < MIN_COVERAGE){
+            return "low_coverage";
+        }
+        else if (spn > MAX_SPAN){
+            return "too_long";
+        }
+
+        //
+        // step 4: put the read into the orientation of the refs
+        //
+        string oseq = this->seq, oqua = this->quality;
+
+        if (this->direction != direction){
+            oseq = this->_reverse_complement(oseq);
+            oqua = string(oqua.rbegin(), oqua.rend());
+        }
+
+        uint head = alns[chain.front()].read_start;
+        uint tail = 0;
+
+        for (uint i = 0; i < chain.size(); i++){
+            tail = tail > alns[chain[i]].read_end ? tail : alns[chain[i]].read_end;
+        }
+
+        if (oseq.size() != this->size || oqua.size() != oseq.size() || tail > oseq.size()){
+            return "sequence_mismatch";
+        }
+
+        //
+        // step 5: rotate the sequence & quality scores
+        //
+        Reconstruction rec;
+        uint first = 0; // idx in chain of the alignment that the sequence starts with
+
+        rec.name      = this->name;
+        rec.direction = direction;
+        rec.naligns   = chain.size();
+        rec.coverage  = cov;
+        rec.nm        = nm;
+        rec.trim_head = head;
+        rec.trim_tail = oseq.size() - tail;
+        rec.switches  = switches;
+
+        uint cut = head;
+
+        if (wraps == 1){
+            const Align &before = alns[chain[wrap_idx - 1]];
+            const Align  &after = alns[chain[wrap_idx]];
+
+            cut          = after.read_start;
+            first        = wrap_idx;
+            rec.wraps    = true;
+            rec.junction = static_cast<int>(after.read_start) - static_cast<int>(before.read_end);
+        }
+
+        rec.start_ref = alns[chain[first]].ref_start + 1;
+        rec.cut       = cut;
+        rec.seq       = oseq.substr(cut, tail - cut) + oseq.substr(head, cut - head);
+        rec.qua       = oqua.substr(cut, tail - cut) + oqua.substr(head, cut - head);
+
+        //
+        // describe the mito genomes used in the order they show up in the new seq
+        // start_ref is the position on the first one listed
+        //
+
+        string last;
+        for (uint i = 0; i < chain.size(); i++){
+            const Align &aln = alns[chain[(first + i) % chain.size()]];
+
+            if (i == 0 || aln.ref_id != last){
+                string d    = i == 0 ? "" : ",";
+                rec.ref_id += d + aln.ref_id;
+                last        = aln.ref_id;
+            }
+            string d  = i == 0 ? "" : "|";
+            rec.path += d + aln.ref_id + ":" + std::to_string(aln.ref_start + 1) + "-" + std::to_string(aln.ref_end);
+        }
+
+        this->_reconstructions.push_back(rec);
+
+        return ""; // no reason, this should evidence of a putative recombination event
+    }
 
 public:
 
@@ -452,7 +673,22 @@ public:
         } // end of itr
 
         //
-        // step 3: best explanation first
+        // step 3: the above didn't work, this could be a recombined mitogenome
+        //
+        if (!this->has_reconstructions() && _mappings.size() > 1){
+            reason = this->_build_split('F', lengths);
+            if (!reason.empty()){
+                this->fail_reasons.push_back("split_" + reason);
+            }
+
+            reason = this->_build_split('R', lengths);
+            if (!reason.empty()){
+                this->fail_reasons.push_back("split_" + reason);
+            }
+        }
+
+        //
+        // step 4: best explanation first
         //
         sort(this->_reconstructions.begin(), this->_reconstructions.end(), 
             [](const Reconstruction &a, const Reconstruction &b){
@@ -842,7 +1078,8 @@ write_mappings(vector<Read> &mappings, unordered_map<string, uint> &lengths){
     unordered_map<string, uint> reasons;
 
     ofh << "#Read\tRef\tStrand\tRead_length\tN_Alignments\tCoverage\tWraps\t"
-        << "Start_Ref\tCut\tJunction\tTrim_Head\tTrim_Tail\tLength\tnm\n";
+        << "Start_Ref\tCut\tJunction\tTrim_Head\tTrim_Tail\tLength\tnm\t"
+        << "Switches\tPath\n";
 
 
     for (int i = 0; i < mappings.size(); i++){
@@ -868,12 +1105,14 @@ write_mappings(vector<Read> &mappings, unordered_map<string, uint> &lengths){
             Reconstruction &rec = reconstructions[j];
             char         strand = rec.direction == 'F' ? '+' : '-';
             string        wraps = rec.wraps ? "Yes" : "No";
+            string         path = rec.path.empty() ? "-" : rec.path;
 
             ofh << rec.name       << '\t' << rec.ref_id    << '\t' << strand        << '\t'
                 << read_len       << '\t' << rec.naligns   << '\t' << rec.coverage  << '\t'
                 << wraps          << '\t' << rec.start_ref << '\t' << rec.cut       << '\t'
                 << rec.junction   << '\t' << rec.trim_head << '\t' << rec.trim_tail << '\t'
-                << rec.seq.size() << '\t' << rec.nm        << '\n';
+                << rec.seq.size() << '\t' << rec.nm        << '\t' << rec.switches  << '\t'
+                << path           << '\n';
         } // end of j
 
         Reconstruction &best = reconstructions.front();
