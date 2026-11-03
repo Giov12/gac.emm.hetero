@@ -158,7 +158,10 @@ def print_fixed_sites(samples: dict[str, str]) -> int:
                     break
             if (fixed == False):
                 break
-            nucs.update(pop_nucs)
+            if (bool(nucs & pop_nucs)):
+                fixed = False
+            else:
+                nucs.update(pop_nucs)
         if (fixed == False or len(nucs) != len(pops)):
             continue
         nucs_str = ','.join([n for n in nucs])
