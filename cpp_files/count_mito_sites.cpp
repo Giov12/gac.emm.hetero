@@ -22,8 +22,7 @@ using std::stoi;
 using std::sort;
 using std::isdigit;
 using std::uint8_t;
-using std::find;
-using std::pair;
+using std::getline;
 
 //
 // given lists of fixed differences [2 column tsv files] between two mitotypes, count the number of
@@ -32,6 +31,10 @@ using std::pair;
 
 typedef unsigned int uint;
 
+struct Site {
+    int16_t pos;
+    char    nuc;
+};
 struct Align {
     string ref_id;
     string cigar;
@@ -239,7 +242,7 @@ parse_map(const string &map_file, unordered_map<string, string> &targets){
     string line, target, path;
     vector<string> parts;
 
-    while (std::getline(fh, line)){
+    while (getline(fh, line)){
         parse_tabular(line, parts);
 
         if (parts.size() != 2){
@@ -268,6 +271,29 @@ parse_map(const string &map_file, unordered_map<string, string> &targets){
 
 };
 
+int
+load_sites(unordered_map<string, string> &targets, unordered_map<string, vector<Site>> &sites){
+
+    //
+    // helper function to load all the fixed sites for each of the
+    // mitotypes
+    //
+
+    for (auto itr = targets.begin(); itr != targets.end(); itr++){
+
+        ifstream fh(itr->second);
+
+        if (!fh.is_open()){
+            cerr << "Error: Unable to open " << itr->second << '\n';
+            exit(EXIT_FAILURE);
+        }
+        string line;
+        while ()
+
+    }
+
+    return 0;
+}
 bool
 check_for_index(const string& bamfile){
     //
@@ -558,6 +584,7 @@ main(int argc, char *args[]){
     // step 1: collect the ids of the targets and the file paths
     //
     unordered_map<string, string> targets;
+    unordered_map<string, vector<Site>> sites;
     unordered_map<string, uint> lengths; // lengths of target
     parse_map(map_file, targets);
     
@@ -566,8 +593,7 @@ main(int argc, char *args[]){
     //
     verify(bamfile, targets, lengths);
 
-
-
+    
     //
     // step 4 collect all the reads that map to the targets
     //
