@@ -72,7 +72,7 @@ def load_pops() -> int:
     return 0
 
 def load_aln() -> dict[str, str]:
-    """extract the exonic sequences"""
+    """load the alignment in single-lined fasta format"""
 
     global aln_file
 
