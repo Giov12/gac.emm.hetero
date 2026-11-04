@@ -557,7 +557,7 @@ collect_alignments(const string &bamfile, vector<Read> &mappings, const unordere
             Read &query = mappings[idx];
 
              // set once
-            if (query.size == 0){ 
+            if (query.size == 0 && is_primary(parts[1])){ 
                 query.size = get_sequence_length(aln.cigar);  
             }
 
