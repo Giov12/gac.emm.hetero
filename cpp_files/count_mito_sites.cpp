@@ -279,8 +279,11 @@ load_sites(unordered_map<string, string> &targets, unordered_map<string, vector<
     // mitotypes
     //
 
+    cerr << "Loading sites to each target...";
+
     for (auto itr = targets.begin(); itr != targets.end(); itr++){
 
+        string target = itr->first;
         ifstream fh(itr->second);
 
         if (!fh.is_open()){
@@ -288,12 +291,50 @@ load_sites(unordered_map<string, string> &targets, unordered_map<string, vector<
             exit(EXIT_FAILURE);
         }
         string line;
-        while ()
+        vector<string> parts;
+        while (getline(fh, line)){
+            parse_tabular(line, parts);
+            
+            if (parts.size() != 2){
+                cerr << "Error: Invalid format in " << itr->second << '\n'
+                     << "Expected 2 columns. Offending line:\n" << line << '\n';
+                exit(EXIT_FAILURE);
+            }
 
+            //
+            // test for valid inputs
+            //
+            try {
+                static_cast<int16_t>(stoi(parts[0]));
+            }
+            catch (const std::invalid_argument){
+                cerr << "Error: Column 1 must be an integer. Found " << parts[0]
+                     << " in " << itr->second << '\n';
+                exit(EXIT_FAILURE);
+            }
+            if (parts[1].size() != 1){
+                cerr << "Error: Column 2 must be a single nucleotide. Found " << parts[1]
+                     << " in " << itr->second << '\n';
+                exit(EXIT_FAILURE);
+            }
+            else if (parts[1] != "A" || parts[1] != "T" || parts[1] != "G" || parts[1] != "C"){
+                cerr << "Error: Invalid character in column 2 in sites file. Found " << parts[1]
+                     << " in " << itr->second << '\n';
+                exit(EXIT_FAILURE);
+            }
+            
+            int16_t pos = static_cast<int16_t>(stoi(parts[0]));
+            char    nuc = parts[1][0];
+
+            sites[target].emplace_back(pos, nuc);
+        }
     }
+
+    cerr << " Done\n";
 
     return 0;
 }
+
 bool
 check_for_index(const string& bamfile){
     //
@@ -593,14 +634,20 @@ main(int argc, char *args[]){
     //
     verify(bamfile, targets, lengths);
 
+    //
+    // step 3: collect the sites
+    //
+    load_sites(targets, sites);
     
     //
-    // step 4 collect all the reads that map to the targets
+    // step 4: collect all the reads that map to the targets
     //
     vector<Read> mappings;
     collect_alignments(bamfile, mappings, targets);
 
-
+    //
+    // step 5: now process each read
+    //
 
     return 0;
 }
