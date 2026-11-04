@@ -20,6 +20,9 @@ using std::cout;
 using std::cerr;
 using std::stoi;
 using std::sort;
+using std::lower_bound; // binary search
+using std::unique;
+using std::toupper;
 using std::isdigit;
 using std::uint8_t;
 using std::getline;
@@ -32,8 +35,11 @@ using std::getline;
 typedef unsigned int uint;
 
 struct Site {
-    int16_t pos;
-    char    nuc;
+    uint pos;
+    char nuc;
+
+    Site(uint pos_, char nuc_) :
+        pos(pos_), nuc(nuc_) {}
 };
 struct Align {
     string ref_id;
@@ -45,10 +51,7 @@ struct Align {
     uint   read_end;
     char   direction;
     bool   hard_clipped;
-    uint    nm; // edit distance from bam file
-    uint8_t id; // id for the alingment, not the read  
 };
-
 
 class Read {
 private:
@@ -58,49 +61,6 @@ private:
         vector<Align> fwd_alignments;
         vector<Align> rev_alignments;
     };
-
-    string _reverse_complement(const string &seq){
-        //
-        // return the reverse compliment of this sequence
-        //
-
-        const uint n = seq.size();
-        string rc(n, 'N'); // string of size n full of N's
-
-        for (uint i = 0; i < n; i++){
-            switch (seq[n - i - 1]) {
-                case 'A':
-                    rc[i] = 'T';
-                    break;
-                case 'C':
-                    rc[i] = 'G';
-                    break;
-                case 'G':
-                    rc[i] = 'C';
-                    break;
-                case 'T':
-                    rc[i] = 'A';
-                    break;
-                case 'a':
-                    rc[i] = 'T';
-                    break;
-                case 'c':
-                    rc[i] = 'G';
-                    break;
-                case 'g':
-                    rc[i] = 'C';
-                    break;
-                case 't':
-                    rc[i] = 'A';
-                    break;
-                default:
-                    rc[i] = 'N'; // unknown char
-                    break;
-            }
-        }
-
-        return rc;
-    }
 
 public:
 
@@ -117,24 +77,33 @@ public:
 
     ~Read(void){
         this->_aligns.clear();
+        this->seq.clear();
     }
 
     bool has_seq(void){
         return !this->seq.empty();
     }
 
-    void add_align(Align &a){
-        this->_aligns.emplace_back(a);
+    bool has_full_seq(void){
+        return !this->seq.empty() && this->seq.size() == this->size;
     }
 
-    void set_seq(const string &seq, const string &quality, char direction){
-
+    void set_seq(const string &seq, char direction){
+        
         if (this->has_seq()){
-            return; // sequence already added
+            return; // seq already added
         }
 
         this->seq       = seq;
         this->direction = direction;
+    }
+
+    void add_align(Align &a){
+        this->_aligns.emplace_back(a);
+    }
+
+    vector<Align> & get_alignments(void){
+        return this->_aligns;
     }
 
 };
@@ -225,7 +194,7 @@ parse_cigar(Align &aln){
 }
 
 int
-parse_map(const string &map_file, unordered_map<string, string> &targets){
+parse_map(const string &map_file, unordered_map<string, string> &targets, vector<string> &order){
 
     //
     // read in the tsv file to ensure that the target files
@@ -258,6 +227,7 @@ parse_map(const string &map_file, unordered_map<string, string> &targets){
             exit(EXIT_FAILURE);
         }
         targets[target] = path;
+        order.push_back(target);
     }
 
     fh.close();
@@ -268,6 +238,8 @@ parse_map(const string &map_file, unordered_map<string, string> &targets){
     }
 
     cerr << "Loaded " << targets.size() << " targets\n";
+
+    return 0;
 
 };
 
@@ -305,9 +277,9 @@ load_sites(unordered_map<string, string> &targets, unordered_map<string, vector<
             // test for valid inputs
             //
             try {
-                static_cast<int16_t>(stoi(parts[0]));
+                static_cast<uint>(stoi(parts[0]));
             }
-            catch (const std::invalid_argument){
+            catch (const std::invalid_argument &error){
                 cerr << "Error: Column 1 must be an integer. Found " << parts[0]
                      << " in " << itr->second << '\n';
                 exit(EXIT_FAILURE);
@@ -317,20 +289,32 @@ load_sites(unordered_map<string, string> &targets, unordered_map<string, vector<
                      << " in " << itr->second << '\n';
                 exit(EXIT_FAILURE);
             }
-            else if (parts[1] != "A" || parts[1] != "T" || parts[1] != "G" || parts[1] != "C"){
+            else if (parts[1] != "A" && parts[1] != "T" && parts[1] != "G" && parts[1] != "C"){
                 cerr << "Error: Invalid character in column 2 in sites file. Found " << parts[1]
                      << " in " << itr->second << '\n';
                 exit(EXIT_FAILURE);
             }
             
-            int16_t pos = static_cast<int16_t>(stoi(parts[0]));
-            char    nuc = parts[1][0];
+            uint pos = static_cast<uint>(stoi(parts[0]));
+            char nuc = parts[1][0];
 
             sites[target].emplace_back(pos, nuc);
-        }
+        } // end of while
+
+        fh.close();
+
+        // sort the sites just to be safe
+        sort(sites[target].begin(), sites[target].end(), []
+            (const Site &a, const Site &b){
+                return a.pos < b.pos;}
+            );
     }
 
     cerr << " Done\n";
+
+    for (auto itr = sites.begin(); itr != sites.end(); itr++){
+        cerr << '\t' << itr->first << ": " << itr->second.size() << " sites\n";
+    }
 
     return 0;
 }
@@ -402,6 +386,50 @@ reverse_strand(const string &flag){
     //
 
     return (stoi(flag) & 0x10) != 0;
+}
+
+string
+reverse_complement(const string &seq){
+    //
+    // return the reverse compliment of this sequence
+    //
+
+    const uint n = seq.size();
+    string rc(n, 'N'); // string of size n full of N's
+
+    for (uint i = 0; i < n; i++){
+        switch (seq[n - i - 1]) {
+            case 'A':
+                rc[i] = 'T';
+                break;
+            case 'C':
+                rc[i] = 'G';
+                break;
+            case 'G':
+                rc[i] = 'C';
+                break;
+            case 'T':
+                rc[i] = 'A';
+                break;
+            case 'a':
+                rc[i] = 'T';
+                break;
+            case 'c':
+                rc[i] = 'G';
+                break;
+            case 'g':
+                rc[i] = 'C';
+                break;
+            case 't':
+                rc[i] = 'A';
+                break;
+            default:
+                rc[i] = 'N'; // unknown char
+                break;
+        }
+    }
+
+    return rc;
 }
 
 int
@@ -498,9 +526,9 @@ collect_alignments(const string &bamfile, vector<Read> &mappings, const unordere
                 continue;
             }
             ref = parts[2];
-            if (targets.count(ref) == 0){
+            if (targets.count(ref) == 0 || is_unmapped(parts[1]) || parts[5] == "*"){
                 line.clear();
-                continue; // not a target chrom
+                continue; // not a target chrom or not aligned
             }
 
             Align aln;
@@ -515,18 +543,6 @@ collect_alignments(const string &bamfile, vector<Read> &mappings, const unordere
             // parse the cigar & add the other attributes (e.g., ref_start)
             //
             parse_cigar(aln);
-
-            //
-            // check if the nm flag was set
-            //
-            aln.nm = 0;
-            for (uint i = 11; i < parts.size(); i++){
-                // equivalent to str.startswith()
-                if (parts[i].compare(0, 5, "NM:i:") == 0){
-                    aln.nm = static_cast<uint>(stoi(parts[i].substr(5)));
-                    break;
-                }
-            }
 
             for (int i = 0; i < mappings.size(); i++){
                 if (mappings[i].name == name){
@@ -548,9 +564,8 @@ collect_alignments(const string &bamfile, vector<Read> &mappings, const unordere
             if (!aln.hard_clipped && parts[9] != "*"){
                 //
                 // parts[9]  == query sequence
-                // parts[10] == query sequence quality scores
                 //
-                query.set_seq(parts[9], parts[10], aln.direction);
+                query.set_seq(parts[9], aln.direction);
             }
             query.add_align(aln);
             line.clear();
@@ -566,10 +581,199 @@ collect_alignments(const string &bamfile, vector<Read> &mappings, const unordere
         exit(EXIT_FAILURE);
     }
     else {
-        cerr << "Found " << mappings.size() << " alignments mapped to target mito genomes\n";
+        cerr << "Found " << mappings.size() << " reads mapped to target mito genomes\n";
     }
 
     return 0;
+}
+
+int
+scan_alignment(const Align &aln, const string &seq, const vector<Site> &markers, vector<uint> &hits){
+    //
+    // helper function to walk through an alignment's cigar and read's
+    // sequence and fill a hits array so that overlapping alignments
+    // does not contribute more than once 
+    //
+
+    const string &cigar = aln.cigar;
+    uint cur  = 0, prev = 0, n = cigar.size();
+    uint rpos = aln.ref_start; // 0-based pos on reference
+    uint qpos = 0;             // 0-based pos on read
+
+    while (cur < n){
+        char c = cigar[cur];
+        if (isdigit(c)){
+            cur++;
+        }
+        else {
+            uint len = stoi(cigar.substr(prev, cur - prev));
+
+            if (c == 'M' || c == '=' || c == 'X'){
+                // this block is aligned to the referenc and is 1 based.
+                // we need to calculate where we are on the reference then
+                // see which markers are from here and scan to the end
+                // of the align block
+                //
+                uint block_start = rpos + 1;
+                uint block_end   = rpos + len;
+
+                auto itr = lower_bound(markers.begin(), markers.end(), block_start,
+                                      [](const Site &s, uint p){ return s.pos < p;});
+
+                // do not go past the markers array or block length
+                for (; itr != markers.end() && itr->pos <= block_end; itr++){
+                    uint idx = qpos + (itr->pos - 1 - rpos);
+                    if (idx < seq.size() && seq[idx] == itr->nuc){
+                        hits.push_back(itr - markers.begin());
+                    }
+                }
+
+                rpos += len;
+                qpos += len;
+            }
+            else if (c == 'I' || c == 'S' || c == 'H'){
+                qpos += len; // consumes only the read
+            }
+            else if (c == 'D' || c == 'N'){
+                rpos += len; // consumes only the reference/target
+            }
+            prev = cur + 1;
+            cur++;
+        }
+    }
+
+    return 0;
+}
+
+int
+count_sites(vector<Read> &mappings, unordered_map<string, vector<Site>> &sites){
+
+    //
+    // this function will loop through all the aligned reads and for each read
+    // count the number of sites that match the targets in the sites mapping
+    // where the key is the target chrom ID. Overlapping alignments are 
+    // taken account of
+    //
+
+    for (uint i = 0; i < mappings.size(); i++){
+        Read &read = mappings[i];
+
+        //
+        // each read will be given a default count of 0
+        //
+        for (auto itr = sites.begin(); itr != sites.end(); itr++){
+            read.counts[itr->first] = 0;
+        }
+
+        if (!read.has_full_seq()){
+            // this read likely came from a hard clipped alignment
+            continue;
+        }
+
+        const string &seq = read.seq;
+        string    rev_seq;
+        unordered_map<string, vector<uint>> hits; // target -> sites with matching nuc
+        vector<Align> &algns = read.get_alignments();
+
+        for (uint j = 0; j < algns.size(); j++){
+            const Align &aln = algns[j];
+            auto         itr = sites.find(aln.ref_id);
+
+            // won't happen but just good practice
+            if (itr == sites.end()){
+                continue;
+            }
+
+            if (aln.direction == read.direction){
+                scan_alignment(aln, seq, itr->second, hits[aln.ref_id]);
+            }
+            else {
+                if (rev_seq.empty()){
+                    // compute once
+                    rev_seq = reverse_complement(seq);
+                }
+                scan_alignment(aln, rev_seq, itr->second, hits[aln.ref_id]);
+            }
+        } // end of algns loop
+
+        // deduplicate sites
+        for (auto itr = hits.begin(); itr != hits.end(); itr++){
+            vector<uint> &h = itr->second;
+
+            // only count each site once
+            sort(h.begin(), h.end());
+            h.erase(unique(h.begin(), h.end()), h.end());
+            read.counts[itr->first] = h.size();
+        }
+    }
+
+    return 0;
+}
+
+int
+write_results(vector<Read> &mappings, vector<string> &order){
+
+    //
+    // helper function to write the tsv file
+    //
+
+    ofstream ofh("Mito_Site_Counts.tsv");
+
+    ofh << "#Read";
+
+    for (uint i = 0; i < order.size(); i++){
+        ofh << '\t' << order[i];
+    }
+    ofh << '\n';
+
+    // for printing stats
+    uint mixed = 0, empty = 0, written = 0, specific = 0, skipped = 0;
+
+    for (uint i = 0; i < mappings.size(); i++){
+        
+        Read &read = mappings[i];
+
+        if (!read.has_full_seq()){
+            skipped++;
+            continue;
+        }
+
+        uint targets = 0;
+        ofh << read.name;
+
+        for (uint j = 0; j < order.size(); j++){
+            uint count = read.counts[order[j]];
+            ofh << '\t' << count;
+
+            if (count > 0){
+                targets++;
+            }
+        }
+
+        ofh << '\n';
+        written++;
+
+        if (targets > 1){
+            mixed++;
+        }
+        else if (targets == 1){
+            specific++;
+        }
+        else {
+            empty++;
+        }
+    }
+
+    ofh.close();
+
+    cerr << "Wrote " << written  << " reads to Mito_Site_Counts.tsv\n"
+         << '\t'     << specific << " reads had sites to only one target\n"
+         << '\t'     << mixed    << " reads had sites for more than one target\n"
+         << '\t'     << empty    << " reads did not have any sites\n"
+         << '\t'     << skipped  << " reads were skipped because their full sequence was not in the bam file\n";
+
+    return 0;
+
 }
 
 void
@@ -627,7 +831,8 @@ main(int argc, char *args[]){
     unordered_map<string, string> targets;
     unordered_map<string, vector<Site>> sites;
     unordered_map<string, uint> lengths; // lengths of target
-    parse_map(map_file, targets);
+    vector<string> order;
+    parse_map(map_file, targets, order);
     
     //
     // step 2: verify that these target chroms are in the bam file
@@ -648,6 +853,12 @@ main(int argc, char *args[]){
     //
     // step 5: now process each read
     //
+    count_sites(mappings, sites);
+
+    //
+    // step 6: write the results
+    //
+    write_results(mappings, order);
 
     return 0;
 }
