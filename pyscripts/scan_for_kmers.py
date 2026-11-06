@@ -12,33 +12,42 @@ ksize    = 17
 aln_file = ''
 pop_file = ''
 popmap   = dict()
+fastas   = list()
 
 def get_arguments() -> int:
     """grab the input files"""
 
-    global aln_file, pop_file, ksize
+    global aln_file, pop_file, ksize, fastas
     
-    desc   = "Helper script to find k-mers where the populations are different in a fasta alignment for each provided sample"
+    desc   = "Helper script to scan for population-specific k-mers obtained from a fasta alignment across fasta sequence files"
     parser = argparse.ArgumentParser(description=desc)
 
     # help messages & description
-    fhelp = "Fasta alignment file [requierd]"
+    ahelp = "Fasta alignment file [requierd]"
     phelp = "Population map in tabular format [required]"
     khelp = "K-mer size [default: 17]"
+    fhelp = "Fasta files (e.g., fa1 fa2 etc..) [required]"
 
-    parser.add_argument("-f", "--fasta", required=True, type=str, help=fhelp)
-    parser.add_argument("-p", "--pops",  required=True, type=str, help=phelp)
-    parser.add_argument("-k", "--ksize", default=ksize, type=int, help=khelp)
+    parser.add_argument("-a", "--algn",   required=True, type=str, help=ahelp)
+    parser.add_argument("-p", "--pops",   required=True, type=str, help=phelp)
+    parser.add_argument("-f", "--fastas", required=True, type=str, help=fhelp, nargs='*')
+    parser.add_argument("-k", "--ksize",  default=ksize, type=int, help=khelp)
 
     args = parser.parse_args()
-    aln_file = args.fasta
+    aln_file = args.algn
     pop_file = args.pops
     ksize    = args.ksize
+    temp     = args.fastas
 
     assert os.path.isfile(aln_file), f"Could not locate {aln_file}"
     assert os.path.isfile(pop_file), f"Could not locate {pop_file}"
 
-    assert ksize > 0, f"--ksize cannot be less than 1"
+    assert len(temp) > 0, "--fastas requires input"
+    assert     ksize > 0, f"--ksize cannot be less than 1"
+
+    for fa in temp:
+        assert os.path.isfile(fa), f"Could not locate {fa}"
+        fastas.append(fa)
 
     return 0
 
@@ -148,11 +157,13 @@ def find_pop_kmers(samples: dict[str, str]) -> dict[str, set[str]]:
     # step 2: find which k-mers are shared across the entire pops
     pop_kmer_cnts = defaultdict(lambda: defaultdict(int))
     pop_cnts      = defaultdict(int)
+    pop_all_kmers = defaultdict(set) # every k-mer found across each pop, even non-fixed ones
 
     for sample, kmers in sample_kmers.items():
         pop = popmap[sample]
         for kmer in kmers:
             pop_kmer_cnts[pop][kmer] += 1
+        pop_all_kmers[pop].update(kmers)
         pop_cnts[pop] += 1
 
     # step 3: find which kmers can be found for all samples
@@ -168,37 +179,100 @@ def find_pop_kmers(samples: dict[str, str]) -> dict[str, set[str]]:
     # step 4: find k-mers not shared across the populations
     pop_specific_kmers = dict()
 
-    for i in range(len(pops)):
-        cur_pop    = pops[i]
-        cur_kmers  = pop_kmers[cur_pop]
-        uniq_kmers = copy.copy(cur_kmers)
-        if (len(cur_kmers) == 0):
-            continue
-        for j in range(len(pops)):
-            if (j == i):
+    for cur_pop in pops:
+        other_kmers = set()
+        for nxt_pop in pops:
+            if (cur_pop == nxt_pop):
                 continue
-            nxt_pop   = pops[j]
-            nxt_kmers = pop_kmers[nxt_pop]
-            if (len(nxt_kmers) == 0):
-                continue
-            shared_kmers = uniq_kmers.intersection(nxt_kmers)
-            if (len(shared_kmers) > 0):
-                uniq_kmers = uniq_kmers.difference(shared_kmers)
-        pop_specific_kmers[cur_pop] = uniq_kmers
+            other_kmers.update(pop_all_kmers[nxt_pop])
+        pop_specific_kmers[cur_pop] = pop_kmers[cur_pop].difference(other_kmers)
+        
+    for p, kmers in pop_specific_kmers.items():
+        print(f"Found {len(kmers)} kmers unique to {p}")
         
     # now we can return the kmer map
     return pop_specific_kmers
 
-def write_kmers(pop_kmers: dict[str, set[str]]) -> int:
-    """Write a simple list of k-mers for each population"""
+def process_seq(seq: str, pop_kmers: dict[str, set[str]]) -> dict[str, int]:
+    """returns counts of either 1 or 0 for each population"""
 
-    for pop, kmers in pop_kmers:
-        fh = open(f"{pop}_kmers.txt", 'w')
-        for kmer in kmers:
-            fh.write(kmer + '\n')
+    global ksize
+
+    counts = {}
+    found  = set()
+
+    # generate k-mers for this sequence
+    for i in range(len(seq) - ksize + 1):
+        kmer = seq[i:i+ksize]
+        for pop, kmers in pop_kmers.items():
+            if (kmer in kmers):
+                found.add(pop)
+        # shared by both
+        if (len(found) == len(pop_kmers)):
+            break
+
+    # try reverse compliment
+    rev_trans = bytes.maketrans(b"ACGTNacgtn", b"TGCANtgcan")
+    seq       = seq.translate(rev_trans)[::-1]
+    for i in range(len(seq) - ksize + 1):
+            kmer = seq[i:i+ksize]
+            for pop, kmers in pop_kmers.items():
+                if (kmer in kmers):
+                    found.add(pop)
+            # shared by both
+            if (len(found) == len(pop_kmers)):
+                break
+
+    for pop in found:
+        counts[pop] = 1
+
+
+    return counts
+
+def scan_fastas(pop_kmers: dict[str, set[str]]) -> int:
+    """print to the console the num of reads each fasta for each category of pop specific k-mers"""
+
+    global fastas
+
+    for fasta in fastas:
+        fh   = open_file(fasta)
+        cnts = {p : 0 for p in pop_kmers}
+        seq  = list()
+
+        # assign a category for both
+        cnts["both"] = 0
+
+        for line in fh:
+            if (len(line) == 0 or line[0] == '#' or line[0] == '\n'):
+                continue
+            if (line[0] == '>'):
+                # new record
+                if (len(seq) > 0):
+                    seq_cnts = process_seq(''.join(seq), pop_kmers)
+                    if (len(seq_cnts) == len(pop_kmers)):
+                        cnts["both"] += 1
+                    else:
+                        for p, cnt in seq_cnts.items():
+                            cnts[p] += cnt
+                seq.clear()
+            else:
+                seq.append(line.strip())
         fh.close()
-        print(f"Wrote {len(kmers)} kmers for {pop}")
-    
+
+        # process last seq
+        if (len(seq) > 0):
+            seq_cnts = process_seq(''.join(seq), pop_kmers)
+            if (len(seq_cnts) == len(pop_kmers)):
+                cnts["both"] += 1
+            else:
+                for p, cnt in seq_cnts.items():
+                    cnts[p] += cnt
+            seq.clear()
+
+        print(f"Counts for {os.path.basename(fasta)}:")
+        for p, cnt in cnts.items():
+            print(f"\tNumber of reads with k-mers shared with {p}:{cnt}")
+
     return 0
 
 def main() -> int:
@@ -207,17 +281,14 @@ def main() -> int:
     # retrieve the arguments
     get_arguments()
 
-    # load the pop info
-    load_pops()
-
     # load the alignment
     samples = load_aln()
 
     # find k-mers specific to each pop
     pop_kmers = find_pop_kmers(samples)
 
-    # now write out the results
-    write_kmers(pop_kmers)
+    # now scan the fasta files for these k-mers
+    scan_fastas(pop_kmers)
 
     return 0
         
