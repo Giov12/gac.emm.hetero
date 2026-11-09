@@ -16,6 +16,7 @@ using std::vector;
 using std::ifstream;
 using std::iostream;
 using std::ofstream;
+using std::pair;
 using std::cout;
 using std::cerr;
 using std::stoi;
@@ -32,7 +33,8 @@ using std::getline;
 // positions that match one of the provided mitotypes
 //
 
-typedef unsigned int uint;
+typedef unsigned int uint; // for depth calculations
+const char nucleotides[5] = {'A', 'C', 'G', 'T', 'N'};
 
 struct Site {
     uint pos;
@@ -40,6 +42,10 @@ struct Site {
 
     Site(uint pos_, char nuc_) :
         pos(pos_), nuc(nuc_) {}
+};
+
+struct SiteDepth {
+    uint counts[5] = {0, 0, 0, 0 ,0};
 };
 struct Align {
     string ref_id;
@@ -366,20 +372,6 @@ is_unmapped(const string &flag){
 }
 
 bool
-is_primary(const string &flag){
-    //
-    // check if the alignment is primary
-    //
-
-    int enc = stoi(flag); // encoding
-
-    if (enc & 0x100 || enc & 0x800){
-        return false; }
-
-    return true;
-}
-
-bool
 reverse_strand(const string &flag){
     //
     // determine if this alignment is on the reverse strand
@@ -544,7 +536,7 @@ collect_alignments(const string &bamfile, vector<Read> &mappings, const unordere
             //
             parse_cigar(aln);
 
-            for (int i = 0; i < mappings.size(); i++){
+            for (uint i = 0; i < mappings.size(); i++){
                 if (mappings[i].name == name){
                     idx = i;
                     break;
@@ -557,7 +549,7 @@ collect_alignments(const string &bamfile, vector<Read> &mappings, const unordere
             Read &query = mappings[idx];
 
              // set once
-            if (query.size == 0 && is_primary(parts[1])){ 
+            if (query.size == 0){ 
                 query.size = get_sequence_length(aln.cigar);  
             }
 
@@ -587,12 +579,27 @@ collect_alignments(const string &bamfile, vector<Read> &mappings, const unordere
     return 0;
 }
 
+uint
+base_index(char b){
+    // helper function to get the idx
+    // found in nucleotides
+    switch (toupper(b)){
+        case 'A': return 0;
+        case 'C': return 1;
+        case 'G': return 2;
+        case 'T': return 3;
+        default:  return 4;
+    }
+}
+
 int
-scan_alignment(const Align &aln, const string &seq, const vector<Site> &markers, vector<uint> &hits){
+scan_alignment(const Align &aln, const string &seq, const vector<Site> &markers, vector<uint> &hits, vector<pair<uint, uint>> &bases){
     //
     // helper function to walk through an alignment's cigar and read's
     // sequence and fill a hits array so that overlapping alignments
-    // does not contribute more than once 
+    // does not contribute more than once. The bases array holds every
+    // (site, nuc) from this read, whether it matches 
+    // or not
     //
 
     const string &cigar = aln.cigar;
@@ -623,8 +630,12 @@ scan_alignment(const Align &aln, const string &seq, const vector<Site> &markers,
                 // do not go past the markers array or block length
                 for (; itr != markers.end() && itr->pos <= block_end; itr++){
                     uint idx = qpos + (itr->pos - 1 - rpos);
-                    if (idx < seq.size() && seq[idx] == itr->nuc){
-                        hits.push_back(itr - markers.begin());
+                    if (idx < seq.size()){
+                        // this read is covered
+                        bases.emplace_back(static_cast<uint>(itr - markers.begin()), base_index(seq[idx]));
+                        if (seq[idx] == itr->nuc){
+                            hits.push_back(itr - markers.begin());
+                        }
                     }
                 }
 
@@ -646,14 +657,18 @@ scan_alignment(const Align &aln, const string &seq, const vector<Site> &markers,
 }
 
 int
-count_sites(vector<Read> &mappings, unordered_map<string, vector<Site>> &sites){
+count_sites(vector<Read> &mappings, unordered_map<string, vector<Site>> &sites, unordered_map<string, vector<SiteDepth>> &depth){
 
     //
     // this function will loop through all the aligned reads and for each read
     // count the number of sites that match the targets in the sites mapping
     // where the key is the target chrom ID. Overlapping alignments are 
-    // taken account of
+    // taken account of. We also calculate depth for each target site
     //
+
+    for (auto itr = sites.begin(); itr != sites.end(); itr++){
+        depth[itr->first].assign(itr->second.size(), SiteDepth());
+    }
 
     for (uint i = 0; i < mappings.size(); i++){
         Read &read = mappings[i];
@@ -673,6 +688,7 @@ count_sites(vector<Read> &mappings, unordered_map<string, vector<Site>> &sites){
         const string &seq = read.seq;
         string    rev_seq;
         unordered_map<string, vector<uint>> hits; // target -> sites with matching nuc
+        unordered_map<string, vector<pair<uint, uint>>> base_counts; // target -> sites with an aligned base
         vector<Align> &algns = read.get_alignments();
 
         for (uint j = 0; j < algns.size(); j++){
@@ -685,14 +701,14 @@ count_sites(vector<Read> &mappings, unordered_map<string, vector<Site>> &sites){
             }
 
             if (aln.direction == read.direction){
-                scan_alignment(aln, seq, itr->second, hits[aln.ref_id]);
+                scan_alignment(aln, seq, itr->second, hits[aln.ref_id], base_counts[aln.ref_id]);
             }
             else {
                 if (rev_seq.empty()){
                     // compute once
                     rev_seq = reverse_complement(seq);
                 }
-                scan_alignment(aln, rev_seq, itr->second, hits[aln.ref_id]);
+                scan_alignment(aln, rev_seq, itr->second, hits[aln.ref_id], base_counts[aln.ref_id]);
             }
         } // end of algns loop
 
@@ -705,19 +721,40 @@ count_sites(vector<Read> &mappings, unordered_map<string, vector<Site>> &sites){
             h.erase(unique(h.begin(), h.end()), h.end());
             read.counts[itr->first] = h.size();
         }
+
+        // repeat for depth
+        for (auto itr = base_counts.begin(); itr != base_counts.end(); itr++){
+            vector<pair<uint, uint>> &b = itr->second;
+            sort(b.begin(), b.end());
+            b.erase(unique(b.begin(), b.end()), b.end());
+            
+            //
+            // one read -> one increment
+            //
+            for (uint k = 0; k < b.size(); k++){
+                depth[itr->first][b[k].first].counts[b[k].second]++;
+            }
+        }
+
+        
     }
 
     return 0;
 }
 
 int
-write_results(vector<Read> &mappings, vector<string> &order){
+write_counts(vector<Read> &mappings, vector<string> &order){
 
     //
     // helper function to write the tsv file
     //
 
     ofstream ofh("Mito_Site_Counts.tsv");
+
+    if (!ofh.is_open()){
+        cerr << "Error: Unable to create the counts file\n";
+        exit(EXIT_FAILURE);
+    }
 
     ofh << "#Read";
 
@@ -773,7 +810,47 @@ write_results(vector<Read> &mappings, vector<string> &order){
          << '\t'     << skipped  << " reads were skipped because their full sequence was not in the bam file\n";
 
     return 0;
+}
 
+int
+write_depth(unordered_map<string, vector<Site>> &sites, unordered_map<string, vector<SiteDepth>> &depth, vector<string> &order){
+
+    //
+    // one row per allele seen at a site: the number of reads with that
+    // nucleotide. 0 counts are ignored
+    //
+
+    ofstream ofh("Mito_Site_Depths.tsv");
+
+    if (!ofh.is_open()){
+        cerr << "Error: Unable to create the depth file\n";
+        exit(EXIT_FAILURE);
+    }
+
+    ofh << "#Target\tPos\tTarget_Nuc\tAllele\tCount\n";
+
+    for (uint i = 0; i < order.size(); i++){
+
+        const vector<Site>       &tsites = sites[order[i]]; // target sites
+        const vector<SiteDepth> &tdepths = depth[order[i]];
+
+        for (uint j = 0; j < tsites.size(); j++){
+            for (uint k = 0; k < 5; k++){
+                if (tdepths[j].counts[k] == 0){
+                    continue;
+                }
+                ofh << order[i]             << '\t' << tsites[j].pos  << '\t' 
+                    << tsites[j].nuc        << '\t' << nucleotides[k] << '\t' 
+                    << tdepths[j].counts[k] << '\n';
+            }
+        }
+    }
+
+    ofh.close();
+
+    cerr << "Wrote site depths to Mito_Site_Depths.tsv\n";
+
+    return 0;
 }
 
 void
@@ -853,12 +930,14 @@ main(int argc, char *args[]){
     //
     // step 5: now process each read
     //
-    count_sites(mappings, sites);
+    unordered_map<string, vector<SiteDepth>> depth; // target -> depth of each site
+    count_sites(mappings, sites, depth);
 
     //
     // step 6: write the results
     //
-    write_results(mappings, order);
+    write_counts(mappings, order);
+    write_depth(sites, depth, order);
 
     return 0;
 }
