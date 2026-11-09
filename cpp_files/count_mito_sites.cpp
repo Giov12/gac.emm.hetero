@@ -21,6 +21,7 @@ using std::cout;
 using std::cerr;
 using std::stoi;
 using std::sort;
+using std::to_string;
 using std::lower_bound; // binary search
 using std::unique;
 using std::toupper;
@@ -46,6 +47,15 @@ struct Site {
 
 struct SiteDepth {
     uint counts[5] = {0, 0, 0, 0 ,0};
+};
+
+struct MixedHit {
+    uint     read; // index of read in mapping
+    string target; // target whose site this is (the less supported target)
+    uint     site; // index into sites[target]
+
+    MixedHit(uint read_, const string &target_, uint site_) :
+        read(read_), target(target_), site(site_) {}
 };
 struct Align {
     string ref_id;
@@ -503,7 +513,12 @@ collect_alignments(const string &bamfile, vector<Read> &mappings, const unordere
     // create a file stream
     //
     string cmd = "samtools view " + bamfile;
-    FILE *fh   = popen(cmd.c_str(), "r");
+
+    for (auto itr = targets.begin(); itr != targets.end(); itr++){
+        cmd += " '" + itr->first + "'";
+    }
+
+    FILE *fh = popen(cmd.c_str(), "r");
 
     int c;
     //
@@ -657,7 +672,8 @@ scan_alignment(const Align &aln, const string &seq, const vector<Site> &markers,
 }
 
 int
-count_sites(vector<Read> &mappings, unordered_map<string, vector<Site>> &sites, unordered_map<string, vector<SiteDepth>> &depth){
+count_sites(vector<Read> &mappings, unordered_map<string, vector<Site>> &sites, 
+           unordered_map<string, vector<SiteDepth>> &depth, vector<MixedHit> &mixed){
 
     //
     // this function will loop through all the aligned reads and for each read
@@ -720,6 +736,36 @@ count_sites(vector<Read> &mappings, unordered_map<string, vector<Site>> &sites, 
             sort(h.begin(), h.end());
             h.erase(unique(h.begin(), h.end()), h.end());
             read.counts[itr->first] = h.size();
+        }
+
+        //
+        // now to check for reads with > 1 mt type and get those counts
+        // we will select the target with the least support
+        //
+        uint with_sites = 0, best = 0, n_best = 0;
+        for (auto itr = read.counts.begin(); itr != read.counts.end(); itr++){
+            if (itr->second > 0){
+                with_sites++;
+            }
+            if (itr->second > best){
+                best   = itr->second;
+                n_best = 1;
+            }
+            else if (itr->second == best && best > 0){
+                n_best++; // tied?
+            }
+        }
+
+        if (with_sites > 1){
+            for (auto itr = hits.begin(); itr != hits.end(); itr++){
+                uint n = read.counts[itr->first];
+                if (n == 0 || (n == best && n_best == 1)){
+                    continue; // no sites or this is the main target
+                }
+                for (uint k = 0; k < itr->second.size(); k++){
+                    mixed.emplace_back(i, itr->first, itr->second[k]);
+                }
+            }
         }
 
         // repeat for depth
@@ -853,6 +899,68 @@ write_depth(unordered_map<string, vector<Site>> &sites, unordered_map<string, ve
     return 0;
 }
 
+int
+write_mixed(vector<Read> &mappings, vector<MixedHit> &mixed, unordered_map<string, vector<Site>> &sites,
+            unordered_map<string, vector<SiteDepth>> &depth, vector<string> &order){
+
+    // write reads that have sites from >1 target mt type
+    // write each site of the less support
+
+    ofstream ofh("Mito_Mixed_Reads.tsv");
+
+    if (!ofh.is_open()){
+        cerr << "Error: Unable to create the mix reads file\n";
+        exit(EXIT_FAILURE);
+    }
+
+    ofh << "#Read\tTarget\tPos\tAllele\tAllele_Depth\tSite_Depth\tMixed_Reads_At_Site\tRead_Counts\n";
+
+    //
+    // calculate the num of reads at each mixed site
+    //
+    unordered_map<string, vector<uint>> shared;
+    for (auto itr = sites.begin(); itr != sites.end(); itr++){
+        shared[itr->first].assign(itr->second.size(), 0);
+    }
+    for (uint i = 0; i < mixed.size(); i++){
+        shared[mixed[i].target][mixed[i].site]++;
+    }
+
+    for (uint i = 0; i < mixed.size(); i++){
+        const MixedHit  &hit = mixed[i];
+        const Site     &site = sites[hit.target][hit.site];
+        const SiteDepth &dep = depth[hit.target][hit.site];
+        Read           &read = mappings[hit.read];
+        uint           total = 0;
+        string summary;
+
+        for (uint k = 0; k < 5; k++){
+            total += dep.counts[k];
+        }
+
+        for (uint j = 0; j < order.size(); j++){
+            if (j > 0){
+                summary += ';';
+            }
+            summary += order[j] + '=' + to_string(read.counts[order[j]]);
+        }
+
+        uint p = base_index(site.nuc);
+        uint c = shared[hit.target][hit.site];
+
+        ofh << read.name << '\t' << hit.target    << '\t' << site.pos << '\t'
+            << site.nuc  << '\t' << dep.counts[p] << '\t' << total    << '\t'
+            << c         << '\t' << summary       << '\n';
+
+    }
+
+    ofh.close();
+
+    cerr << "Wrote " << mixed.size() << " sites from reads with more than one target to Mito_Mixed_Reads.tsv\n";
+
+    return 0;
+}
+
 void
 help(void){
     cerr << "./count_mito_sites -b input.bam -m map_file.tsv\n"
@@ -930,14 +1038,16 @@ main(int argc, char *args[]){
     //
     // step 5: now process each read
     //
+    vector<MixedHit> mixed; // sites of less supported target for reads containing >1 mt type
     unordered_map<string, vector<SiteDepth>> depth; // target -> depth of each site
-    count_sites(mappings, sites, depth);
+    count_sites(mappings, sites, depth, mixed);
 
     //
     // step 6: write the results
     //
     write_counts(mappings, order);
     write_depth(sites, depth, order);
+    write_mixed(mappings, mixed, sites, depth, order);
 
     return 0;
 }
