@@ -13,11 +13,13 @@ aln_file = ''
 pop_file = ''
 popmap   = dict()
 fastas   = list()
+write    = False
+flag     = False
 
 def get_arguments() -> int:
     """grab the input files"""
 
-    global aln_file, pop_file, ksize, fastas
+    global aln_file, pop_file, ksize, fastas, write, flag
     
     desc   = "Helper script to scan for population-specific k-mers obtained from a fasta alignment across fasta sequence files"
     parser = argparse.ArgumentParser(description=desc)
@@ -27,17 +29,23 @@ def get_arguments() -> int:
     phelp = "Population map in tabular format [required]"
     khelp = "K-mer size [default: 17]"
     fhelp = "Fasta files (e.g., fa1 fa2 etc..) [required]"
+    whelp = "If set, write each population's kmers to a fasta file"
+    Fhelp = "If set, flag sequences with uniq k-mers from multiple populations"
 
     parser.add_argument("-a", "--algn",   required=True, type=str, help=ahelp)
     parser.add_argument("-p", "--pops",   required=True, type=str, help=phelp)
     parser.add_argument("-f", "--fastas", required=True, type=str, help=fhelp, nargs='*')
     parser.add_argument("-k", "--ksize",  default=ksize, type=int, help=khelp)
+    parser.add_argument("-w", "--write",  action="store_true",     help=whelp)
+    parser.add_argument("-F", "--flag",   action="store_true",     help=Fhelp)
 
     args = parser.parse_args()
     aln_file = args.algn
     pop_file = args.pops
     ksize    = args.ksize
     temp     = args.fastas
+    write    = args.write
+    flag     = args.flag
 
     assert os.path.isfile(aln_file), f"Could not locate {aln_file}"
     assert os.path.isfile(pop_file), f"Could not locate {pop_file}"
@@ -193,6 +201,25 @@ def find_pop_kmers(samples: dict[str, str]) -> dict[str, set[str]]:
     # now we can return the kmer map
     return pop_specific_kmers
 
+def write_kmers(pop_kmers: dict[str, set[str]]) -> int:
+    """helper function to write the k-mers found to be uniq to a fasta file"""
+
+    fh = open("population_kmers.fasta", 'w')
+
+    # ensure consistency
+    order = sorted(pop_kmers.keys())
+
+    for pop in order:
+        kmers = sorted(pop_kmers[pop])
+        for i, kmer in enumerate(kmers, start=1):
+            fh.write(f">{pop}_kmer{i}\n{kmer}\n")
+
+    fh.close()
+
+    print("Wrote uniq k-mers to fasta")
+
+    return 0
+
 def process_seq(seq: str, pop_kmers: dict[str, set[str]]) -> dict[str, int]:
     """returns counts of either 1 or 0 for each population"""
 
@@ -226,18 +253,27 @@ def process_seq(seq: str, pop_kmers: dict[str, set[str]]) -> dict[str, int]:
     for pop in found:
         counts[pop] = 1
 
-
     return counts
+
+def make_flag(fasta: str) -> TextIO:
+    """helper function to determine file handler"""
+
+    if (fasta.endswith(".gz")):
+        return gzip.open(f"flagged_{os.path.basename(fasta)}", "wt")
+    else:
+        return open(f"flagged_{os.path.basename(fasta)}", 'w')
 
 def scan_fastas(pop_kmers: dict[str, set[str]]) -> int:
     """print to the console the num of reads each fasta for each category of pop specific k-mers"""
 
-    global fastas
+    global fastas, flag
 
     for fasta in fastas:
         fh   = open_file(fasta)
         cnts = {p : 0 for p in pop_kmers}
         seq  = list()
+        prev = ''
+        ofh  = make_flag(fasta) if flag else None
 
         # assign a category for both
         cnts["both"] = 0
@@ -251,9 +287,13 @@ def scan_fastas(pop_kmers: dict[str, set[str]]) -> int:
                     seq_cnts = process_seq(''.join(seq), pop_kmers)
                     if (len(seq_cnts) == len(pop_kmers)):
                         cnts["both"] += 1
+                        if (flag):
+                            ofh.write(prev)
+                            ofh.write(''.join(seq) + '\n')
                     else:
                         for p, cnt in seq_cnts.items():
                             cnts[p] += cnt
+                prev = line
                 seq.clear()
             else:
                 seq.append(line.strip())
@@ -264,10 +304,16 @@ def scan_fastas(pop_kmers: dict[str, set[str]]) -> int:
             seq_cnts = process_seq(''.join(seq), pop_kmers)
             if (len(seq_cnts) == len(pop_kmers)):
                 cnts["both"] += 1
+                if (flag):
+                    ofh.write(prev)
+                    ofh.write(''.join(seq) + '\n')
             else:
                 for p, cnt in seq_cnts.items():
                     cnts[p] += cnt
             seq.clear()
+
+        if (ofh != None):
+            ofh.close()
 
         print(f"Counts for {os.path.basename(fasta)}:")
         for p, cnt in cnts.items():
@@ -286,6 +332,11 @@ def main() -> int:
 
     # find k-mers specific to each pop
     pop_kmers = find_pop_kmers(samples)
+
+    global write
+    # optional write
+    if (write):
+        write_kmers(pop_kmers)
 
     # now scan the fasta files for these k-mers
     scan_fastas(pop_kmers)
