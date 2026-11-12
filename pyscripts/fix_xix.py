@@ -1,12 +1,9 @@
 #!/usr/bin/env python3
-
 import argparse
 import sys
 import os
 import gzip
-import numpy as np
 from typing import TextIO
-from collections import defaultdict
 
 #
 # this code is specifically designed to take diploid
