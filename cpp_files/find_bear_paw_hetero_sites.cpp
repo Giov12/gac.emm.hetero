@@ -649,8 +649,8 @@ is_exonic(const uint pos, vector<Gene*>*genes, vector<uint> &gene_ends){
 }
 
 int
-parse_vcf(const string &vcf, const bool only_genic, unordered_map<string, unique_ptr<Sample>> &pop_map,
-          unordered_map<string, vector<Gene*>> &genome){
+parse_vcf(const string &vcf, const bool only_genic, 
+          unordered_map<string, unique_ptr<Sample>> &pop_map, unordered_map<string, vector<Gene*>> &genome){
 
     //
     // this function will be the main work horse for this
@@ -668,22 +668,21 @@ parse_vcf(const string &vcf, const bool only_genic, unordered_map<string, unique
     //
     
     vector<string> parts;
-    vector<Sample> samples;
     vector<Gene*> *genes;
+    vector<string> samples;
     vector<uint> gene_ends;
     string line, sample, chrom, curChrom;
     uint   pos, ngenes, furthest;
-    bool   keep_reading;
+    bool   keep_reading, valid;
     uint valid_sites = 0;
 
     //
     // we need to treat the MT genome & sex chromosomes
     // differently
     //
-    const string MT = "MT";
-    const string Y  = "Y";
-    const string X  = "XIX";
-
+    const string MT = "MT";  // haploid for all
+    const string Y  = "Y";   // haploid for males, missing in females
+    const string X  = "XIX"; // haploid for males 2.5 Mb and onwards
 
     while (true){
         keep_reading = read_line(gzipped, gz_fh, txt_fh, line);
@@ -710,7 +709,10 @@ parse_vcf(const string &vcf, const bool only_genic, unordered_map<string, unique
                 // now parse through
                 for (uint i = 9; i < parts.size(); i++){
                     sample = parts[i];
-                    samples.push_back({sample, 0, 0});
+                    if (pop_map.count(sample) == 0){
+                        cerr << "Skipping " << sample << " in this analysis\n";
+                    }
+                    samples.push_back(sample);
                 }
             }
             continue;
@@ -731,10 +733,12 @@ parse_vcf(const string &vcf, const bool only_genic, unordered_map<string, unique
         }
         parse_tabular(line, parts);
 
-        bool valid = true;
 
-        if (only_genic){ // we care only about the exonic regions
-            chrom = parts[0];
+        chrom = parts[0];
+        valid = true;
+
+        // if using only genes, confirm that it is exonic about the exonic regions
+        if (only_genic){ 
 
             if (genome.count(chrom) == 0){
                 continue; // no genes on this chrom
@@ -774,16 +778,6 @@ parse_vcf(const string &vcf, const bool only_genic, unordered_map<string, unique
             continue;
         }
 
-        for (uint i = 9; i < parts.size(); i++){
-            uint sample_idx = i - 9;
-            string geno     = parts[i];
-            geno            = geno.substr(0, geno.find(':')); 
-            if (geno.find('.') != string::npos){ // missing data
-                continue;
-            }
-            samples[sample_idx].tot++;
-            samples[sample_idx].het += is_hetero(geno);
-        }
 
     } // end of file parsing
 
@@ -794,12 +788,6 @@ parse_vcf(const string &vcf, const bool only_genic, unordered_map<string, unique
     }
 
     cerr << std::fixed << setprecision(3);
-    
-    for (uint i = 0; i < samples.size(); i++){
-        Sample &s = samples[i];
-        double hetero = s.tot > 0 ? ((double)s.het / (double)s.tot) * 100.0 : 0.0;
-        cerr << "Sample " << s.sample << ' ' << hetero << "% hetero\n";
-    }
 
     return 0;
 }
@@ -817,7 +805,6 @@ help(){
 int main(int argc, char *argv[]){
 
     string vcf, ann, pop_file, arg, genes_list;
-    unordered_map<string, vector<Gene*>> genome;
     
     // expect at least a single argument
     if (argc < 2){
@@ -864,6 +851,7 @@ int main(int argc, char *argv[]){
     // to only look at exonic regions for
     // protein coding genes
     //
+    unordered_map<string, vector<Gene*>> genome;
     bool use_ann = !ann.empty();
     if (use_ann){
         if (!file_exists(ann)){
@@ -882,9 +870,13 @@ int main(int argc, char *argv[]){
         load_target_genes(genes_list, only_targets, target_genes);
         parse_annotation(ann, genome, only_targets, target_genes);
     }
+
+    // load the samples
+    unordered_map<string, unique_ptr<Sample>> pop_map;
+    parse_popmap(pop_file, pop_map);
     
     // parse the vcf file
-    parse_vcf(vcf, use_ann, genome);
+    parse_vcf(vcf, use_ann, pop_map, genome);
 
     return 0;
 }
