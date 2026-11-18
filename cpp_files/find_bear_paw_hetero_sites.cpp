@@ -20,10 +20,12 @@ using std::cout;
 using std::stoi;
 using std::sort;
 using std::find;
+using std::to_string;
 using std::unordered_map;
 using std::unordered_set;
 using std::setprecision;
 using std::stod;
+using std::stoi;
 
 //
 // this code is specifically designed. for finding heterozygous
@@ -40,9 +42,21 @@ enum Sex {
     Female = 1
 };
 
+enum Strand {
+    Unknown = 0,
+    Forward = 1,
+    Reverse = 2
+};
+
 enum mtType {
     ENA = 0,
     TNP = 1
+};
+
+enum RegionType {
+    NoRegion = 0,
+    Exonic   = 1,
+    promoter = 2
 };
 
 enum Classification {
@@ -68,14 +82,29 @@ public:
     string       name;
     uint         start;
     uint         end;
+    Strand       strand;
     vector<Exon> exons;
 
-    Gene (string id_, string name, uint start, uint end){
-        this->id    = id_;
-        this->name  = name;
-        this->start = start;
-        this->end   = end;
+    //
+    // members for searching for sites possibly
+    // upstream in the promoter region
+    //
+    bool has_promoter = false;
+    uint prom_start   = 0;
+    uint prom_end     = 0;
+    uint search_start = 0;
+    uint search_end   = 0;
+
+    Gene (string id_, string name, uint start, uint end, Strand strand){
+        this->id           = id_;
+        this->name         = name;
+        this->start        = start;
+        this->end          = end;
+        this->strand       = strand;
+        this->search_start = start;
+        this->search_end   = end;
     };
+
     ~Gene(){
         this->exons.clear();
     }
@@ -138,7 +167,7 @@ public:
         this->exons = resolved;
     }
 
-    bool is_exonic(uint pos){
+    bool is_exonic(const uint pos){
         //
         // exons are ordered,
         // so just see if there is an overlap
@@ -152,6 +181,52 @@ public:
         }
         // no overlap
         return false;
+    }
+
+    bool in_promoter(const uint pos){
+        //
+        // is this site in the promoter search space
+        //
+        if (this->has_promoter){
+            return this->prom_start <= pos && pos <= this->prom_end;
+        }
+        return false;
+    }
+
+    void set_promoter(const uint upstream){
+
+        //
+        // the promoter is upstream of the first
+        // exon accounting for strand orientation
+        //
+
+        if (upstream == 0 || this->strand == Strand::Unknown){
+            return; // nothing to do
+        }
+
+        if (this->strand == Strand::Forward){
+            if (this->start <= 1){
+                return; // edge case
+            }
+            if (this->start > upstream){ // avoid negative positions
+                this->prom_start = this->start - upstream;
+            }
+            else {
+                this->prom_start = 1;
+            }
+            this->prom_end     = this->start - 1;
+            this->search_start = this->prom_start;
+        }
+        else if (this->strand == Strand::Reverse){
+            this->prom_start = this->end + 1;
+            this->prom_end   = this->end + upstream;
+            this->search_end = this->prom_end;
+        }
+        else {
+            return; // unknown strand, shouldn't trigger
+        }
+
+        this->has_promoter = true;
     }
 
     void set_as_coding(void){
@@ -444,7 +519,7 @@ parse_attributes(string &attributes, vector<Attribute> &atrbVec){
 
 int
 parse_annotation(const string &ann, unordered_map<string, vector<Gene*>> &genome,
-                 const bool only_targets, unordered_set<string> &target_genes){
+                 const bool only_targets, unordered_set<string> &target_genes, uint upstream){
     //
     // collect genes in this specific file and optionally only
     // those in the targets container
@@ -522,7 +597,19 @@ parse_annotation(const string &ann, unordered_map<string, vector<Gene*>> &genome
             start = (uint)stoi(parts[3]);
             end   = (uint)stoi(parts[4]);
             if (parts[2] == "gene"){
-                g = new Gene(gene_id, gene_name, start, end);
+                Strand strand;
+                switch (parts[6][0]) {
+                    case '+':
+                        strand = Strand::Forward;
+                        break;
+                    case '-':
+                        strand = Strand::Reverse;
+                        break;
+                    default:
+                        strand = Strand::Unknown;
+                        break;
+                    }
+                g = new Gene(gene_id, gene_name, start, end, strand);
                 gene_map[chrom][gene_id] = g;
             }
             else if (gene_map[chrom].find(gene_id) != gene_map[chrom].end()) {
@@ -564,6 +651,7 @@ parse_annotation(const string &ann, unordered_map<string, vector<Gene*>> &genome
                 continue;           // skip non-coding genes
             }
             jtr->second->resolve_exons(); // collapse & merge exons
+            jtr->second->set_promoter(upstream);
             chrom_genes.push_back(jtr->second);
             total++;
         }
@@ -571,10 +659,10 @@ parse_annotation(const string &ann, unordered_map<string, vector<Gene*>> &genome
         // now sort for downstream binary search
         sort(chrom_genes.begin(), chrom_genes.end(),[]
             (const Gene *geneA, const Gene *geneB){
-                if (geneA->start == geneB->start){
-                    return geneA->end < geneB->end;
+                if (geneA->search_start == geneB->search_start){
+                    return geneA->search_end < geneB->search_end;
                 }
-                return geneA->start < geneB->start;
+                return geneA->search_start < geneB->search_start;
             }  
         );
     }
@@ -633,12 +721,15 @@ clean_up(unordered_map<string, vector<Gene*>> &genome, unordered_map<string, Sam
 }
 
 Gene *
-is_exonic(const uint pos, vector<Gene*>*genes, vector<uint> &gene_ends){
+is_candidate_region(const uint pos, vector<Gene*>*genes, vector<uint> &gene_ends, RegionType &region){
+
     //
     // helper function to determine
-    // whether this site lands on a single exon
-    // return a nullptr if no overlap
+    // whether this site lands on an exonic region, a candidate promoter region, 
+    // or neither
     //
+
+    region = RegionType::NoRegion;
 
     if (genes->empty()){
         return nullptr; // no genes to search through
@@ -660,28 +751,31 @@ is_exonic(const uint pos, vector<Gene*>*genes, vector<uint> &gene_ends){
     }
 
     Gene *gene;
-    bool found = false; // did we find a candidate
-    if (left < ngenes){
-        gene  = (*genes)[left];
-        found = gene->start <= pos;
-    }
+    Gene *promoter_hit = nullptr;
 
-    if (found){
-        while (left < ngenes){
-            gene = (*genes)[left];
-            if (gene->start <= pos && pos <= gene->end){
-                if (gene->is_exonic(pos)){
-                    return gene; // lands in an exon
-                }
-            }
-            else if (pos < gene->start){
-                break; // position is before the gene begins
-            }
-            left++;
+    while (left < ngenes){
+        gene = (*genes)[left];
+        
+        if (pos < gene->search_start){
+            break; // this & all later genes begin after pos
         }
+        if (pos <= gene->search_end){
+            if (gene->start <= pos && pos <= gene->end && gene->is_exonic(pos)){
+                region = RegionType::Exonic;
+                return gene; // lands in an exon
+            }
+            else if (promoter_hit == nullptr && gene->in_promoter(pos)){
+                promoter_hit = gene; // keep looking for an exon
+            }
+        }
+        left++;
     }
 
-    return nullptr; // never hit true
+    if (promoter_hit != nullptr){
+        region = RegionType::promoter;
+    }
+
+    return promoter_hit; // this may never change from nullptr
 }
 
 bool
@@ -1062,7 +1156,7 @@ write_header(ofstream &fh, const vector<string> &pops){
     //
     // write the column headers for the output tsv
     //
-    fh << "#Chrom\tBP\tGene_id\tRef\tAlt\tClass\t"
+    fh << "#Chrom\tBP\tGene_id\tRegion\tRef\tAlt\tClass\t"
        << pops[0] << "_allele\t"   << pops[1] << "_allele\t"
        << pops[0] << "_freq\t"     << pops[1] << "_freq\t"
        << pops[0] << "_nalleles\t" << pops[1] << "_nalleles";
@@ -1137,7 +1231,7 @@ genotype_summary(const vector<Sample*> &samples, const vector<uint> &ploidy,
         if (!summary.empty()){
             summary += ", ";
         }
-        summary += std::to_string(counts[i]) + ' ' + labels[i];
+        summary += to_string(counts[i]) + ' ' + labels[i];
     }
 
     if (summary.empty()){
@@ -1149,7 +1243,7 @@ genotype_summary(const vector<Sample*> &samples, const vector<uint> &ploidy,
 
 void
 write_site(ofstream &fh, const string &chrom, const uint pos, const Gene *gene,
-           const string &ref, const string &alt, const Classification c,
+           const RegionType region, const string &ref, const string &alt, const Classification c,
            const int ena_allele, const uint pure_alt[2], const uint pure_n[2],
            const uint bp[2][4], const vector<Sample*> &samples,
            const vector<uint> &ploidy, const vector<int> &alt_copies){
@@ -1179,14 +1273,16 @@ write_site(ofstream &fh, const string &chrom, const uint pos, const Gene *gene,
     }
 
     string c_label;
-    if (c == Classification::Diff){
-        c_label = "DIFF";
-    }
-    else if (c == Classification::Private){
-        c_label = "PRIVATE";
-    }
-    else {
-        c_label = "UNINFORMATIVE"; // should not happen
+    switch (c) {
+        case Classification::Diff:
+            c_label = "DIFF";
+            break;
+        case Classification::Private:
+            c_label = "PRIVATE";
+            break;
+        default:
+            c_label = "UNINFORMATIVE";
+            break;
     }
 
     string gene_id = ".";
@@ -1194,11 +1290,24 @@ write_site(ofstream &fh, const string &chrom, const uint pos, const Gene *gene,
         gene_id = gene->id;
     }
 
-    fh << chrom    << '\t' << pos      << '\t' << gene_id << '\t'
-       << ref      << '\t' << alt      << '\t' << c_label << '\t'
-       << ena_base << '\t' << tnp_base << '\t'
-       << ena_freq << '\t' << tnp_freq << '\t'
-       << pure_n[0] << '\t' << pure_n[1];
+    string r_label;
+    switch (region) {
+        case RegionType::Exonic:
+            r_label = "exon";
+            break;
+        case RegionType::promoter:
+            r_label = "promoter";
+            break;
+        default:
+            r_label = ".";
+            break;
+    }
+
+    fh << chrom    << '\t' << pos      << '\t' << gene_id   << '\t'
+       << r_label  << '\t' << ref      << '\t' << alt       << '\t'
+       << c_label  << '\t'<< ena_base  << '\t' << tnp_base  << '\t'
+       << ena_freq << '\t' << tnp_freq << '\t' << pure_n[0] << '\t' 
+       << pure_n[1];
 
     for (uint i = 0; i < 2; i++){
         for (uint j = 0; j < 4; j++){
@@ -1253,12 +1362,14 @@ parse_vcf(const string &vcf, const bool only_exonic, const double min_freq,
     vector<Sample*> samples;
     vector<uint>    gene_ends, ploidy;
     vector<int>     alt_copies;
-    Classification clsfion;
+    Classification  clsfion;
+    RegionType      region;
     string line, sample, chrom, curChrom;
     uint   pos, ngenes, furthest;
     bool   keep_reading;
     int    gt_idx, ena_allele;
-    uint valid_sites = 0, snp_sites = 0, informative = 0, passed = 0, miss_cnt = 0;
+    uint snp_sites = 0, informative = 0;
+    uint passed = 0, miss_cnt = 0, exonic_sites = 0, promoter_sites = 0;
     uint pure_alt[2], pure_n[2]; // per site tallies for "pure" populations
     uint bp[2][4];               // per site bear paw genotype counts
     Gene *gene;
@@ -1325,10 +1436,10 @@ parse_vcf(const string &vcf, const bool only_exonic, const double min_freq,
             exit(EXIT_FAILURE);
         }
 
-        chrom = parts[0];
-        pos   = (uint)stoi(parts[1]);
-        gene  = nullptr;
-
+        chrom  = parts[0];
+        pos    = (uint)stoi(parts[1]);
+        gene   = nullptr;
+        region = RegionType::NoRegion;
         // if using only genes, confirm that it is exonic about the exonic regions
         if (only_exonic){ 
 
@@ -1346,19 +1457,24 @@ parse_vcf(const string &vcf, const bool only_exonic, const double min_freq,
                 gene_ends.resize(ngenes);
 
                 for (uint n = 0; n < ngenes; n++){
-                    if ((*genes)[n]->end > furthest){
-                        furthest = (*genes)[n]->end; 
+                    if ((*genes)[n]->search_end > furthest){
+                        furthest = (*genes)[n]->search_end;
                     }
                     gene_ends[n] = furthest;
                 }
             }
             
             // check if this position is exonic
-            gene = is_exonic(pos, genes, gene_ends);
+            gene = is_candidate_region(pos, genes, gene_ends, region);
             if (gene == nullptr){
                 continue;
             }
-            valid_sites++;
+            if (region == RegionType::Exonic){
+                exonic_sites++;
+            }
+            else if (region == RegionType::promoter){
+                promoter_sites++;
+            }
         }
         
         // only focusing on biallelic sites
@@ -1401,7 +1517,7 @@ parse_vcf(const string &vcf, const bool only_exonic, const double min_freq,
             continue;
         }
         passed++;
-        write_site(ofh, chrom, pos, gene, ref, alt, clsfion, ena_allele, pure_alt, pure_n, bp, 
+        write_site(ofh, chrom, pos, gene, region, ref, alt, clsfion, ena_allele, pure_alt, pure_n, bp, 
                    samples, ploidy, alt_copies);
 
 
@@ -1411,7 +1527,8 @@ parse_vcf(const string &vcf, const bool only_exonic, const double min_freq,
     ofh.close();
 
     if (only_exonic){
-        cerr << "Total exonic sites scanned " << valid_sites << '\n';
+        cerr << "Total exonic sites scanned "   << exonic_sites   << '\n'
+             << "Total promoter sites scanned " << promoter_sites << '\n';
     }
 
     cerr << "Biallelic SNPs scanned "    << snp_sites << '\n'
@@ -1424,14 +1541,15 @@ parse_vcf(const string &vcf, const bool only_exonic, const double min_freq,
 
 void
 help(){
-    cerr << "Usage: ./find_bear_paw_hetero_sites -v vcf_file -p popmap.tsv -m <float> -f <float> -x <float> -a ann.gtf [optional] -g gene_list.txt [optional]\n"
+    cerr << "Usage: ./find_bear_paw_hetero_sites -v vcf_file -p popmap.tsv -m <float> -f <float> -x <float> -u <int> -a ann.gtf [optional] -g gene_list.txt [optional]\n"
          << "\t-v: vcf file containing the bear paw samples along with the other TNP and ENA stickleback population [required]\n"
          << "\t-p: A population map containing 3 columns: [Sample][Population][Sex] [required]\n"
          << "\t-m: Minimum frequency of an allele in a population (0.5 < x <= 1), to consider it differentiated [default: 1.0]\n"
          << "\t-f: Minimum fraction of Bear Paw Samples to carry the specific mt-Type allele [default: 1.0]\n"
          << "\t-x: Maximum fraction of missing samples allowed in each group [default: 1.0; no filter]\n"
          << "\t-a: The genome annotation file to overlap SNPs with\n"
-         << "\t-g: A file contain the gene_ids (one per line) of interest. Only these genes will be investigated in the annotation\n";
+         << "\t-g: A file contain the gene_ids (one per line) of interest. Only these genes will be investigated in the annotation\n"
+         << "\t-u: Number of sites to look upstream of a gene when using a genome annotation [default: 0]\n";
     exit(1);
 }
 
@@ -1439,7 +1557,8 @@ int main(int argc, char *argv[]){
 
     string vcf, ann, pop_file, arg, genes_list;
     double min_freq = 1.0, min_frac = 1.0, max_missing = 1.0;
-    
+    int upstream = 0;
+
     // expect at least a single argument
     if (argc < 2){
         help();
@@ -1504,6 +1623,20 @@ int main(int argc, char *argv[]){
                 exit(EXIT_FAILURE);
             }
         }
+        else if (arg == "-u" && i + 1 < argc){
+            try {
+                upstream = stoi(argv[i + 1]);
+
+                if (upstream < 0){
+                    cerr << "Error: -u cannot be less than 0\n";
+                    exit(EXIT_FAILURE);
+                }
+            }
+            catch (const std::invalid_argument &e){
+                cerr << "Error: -u must be an integer. Encountered " << argv[i + 1] << '\n';
+                exit(EXIT_FAILURE);
+            }
+        }
     }
     if (vcf.empty()){
         cerr << "-v vcf_file is required\n";
@@ -1545,7 +1678,10 @@ int main(int argc, char *argv[]){
         }
         unordered_set<string> target_genes;
         load_target_genes(genes_list, only_targets, target_genes);
-        parse_annotation(ann, genome, only_targets, target_genes);
+        parse_annotation(ann, genome, only_targets, target_genes, (uint)upstream);
+    }
+    else if (upstream > 0){
+        cerr << "Ignoring -u parameter\n";
     }
 
     // load the samples
