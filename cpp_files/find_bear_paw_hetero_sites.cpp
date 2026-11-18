@@ -1073,14 +1073,86 @@ write_header(ofstream &fh, const vector<string> &pops){
            << "het\t" << b << "homTNP\t" << b
            << "miss";
     }
-    fh << '\n';
+
+    // for genotype summaries
+    fh << '\t' << pops[0] << "_genotypes"
+       << '\t' << "BP_"   << pops[0]      << "_genotypes"
+       << '\t' << "BP_"   << pops[1]      << "_genotypes"
+       << '\t' << pops[1] << "_genotypes" << '\n';
+
+}
+
+string
+genotype_summary(const vector<Sample*> &samples, const vector<uint> &ploidy,
+                 const vector<int> &alt_copies, const string &ref, const string &alt,
+                 const mtType pop, const bool bear_paw){
+
+    //
+    // summary the genotypes of for the current pop (e.g., bear paw ENA)
+    // entries will look something like "10 A/A, 2 A/T, 1 ./."
+    //
+    // counts:
+    //  [0] ref/ref [1] ref/alt [2] alt/alt [3] ./.
+    //  [4] ref     [5] alt     [6] .
+    //
+
+    uint counts[7] = {0, 0, 0, 0, 0, 0, 0};
+
+    for (uint i = 0; i < samples.size(); i++){
+        Sample *sample = samples[i];
+
+        if (sample == nullptr || ploidy[i] == 0){
+            continue; // females at y do not contribute
+        }
+
+        if (sample->pop != pop || sample->bear_paw != bear_paw){
+            continue; // not part of this group
+        }
+
+        if (ploidy[i] == 2){
+            if (alt_copies[i] == -1){
+                counts[3]++;
+            }
+            else {
+                counts[alt_copies[i]]++;
+            }
+        }
+        else {
+            if (alt_copies[i] == -1){
+                counts[6]++;
+            }
+            else {
+                counts[4 + alt_copies[i]]++;
+            }
+        }
+    } // end of i
+
+    const string labels[7] = {ref + '/' + ref, ref + '/' + alt, alt + '/' + alt, "./.", ref, alt, "."};
+
+    string summary;
+    for (uint i = 0; i < 7; i++){
+        if (counts[i] == 0){
+            continue;
+        }
+        if (!summary.empty()){
+            summary += ", ";
+        }
+        summary += std::to_string(counts[i]) + ' ' + labels[i];
+    }
+
+    if (summary.empty()){
+        summary = "."; // no samples?
+    }
+
+    return summary;
 }
 
 void
 write_site(ofstream &fh, const string &chrom, const uint pos, const Gene *gene,
            const string &ref, const string &alt, const Classification c,
            const int ena_allele, const uint pure_alt[2], const uint pure_n[2],
-           const uint bp[2][4]){
+           const uint bp[2][4], const vector<Sample*> &samples,
+           const vector<uint> &ploidy, const vector<int> &alt_copies){
     //
     // write a passing site to the output tsv
     // freqs are of the ENA allele in pure ENA &
@@ -1133,7 +1205,12 @@ write_site(ofstream &fh, const string &chrom, const uint pos, const Gene *gene,
             fh << '\t' << bp[i][j];
         }
     }
-    fh << '\n';
+    // genotype summaries: ENA, BP ENA, BP TNP, TNP
+    fh << '\t' << genotype_summary(samples, ploidy, alt_copies, ref, alt, mtType::ENA, false)
+       << '\t' << genotype_summary(samples, ploidy, alt_copies, ref, alt, mtType::ENA, true)
+       << '\t' << genotype_summary(samples, ploidy, alt_copies, ref, alt, mtType::TNP, true)
+       << '\t' << genotype_summary(samples, ploidy, alt_copies, ref, alt, mtType::TNP, false) << '\n';
+
 }
 
 int
@@ -1324,7 +1401,8 @@ parse_vcf(const string &vcf, const bool only_exonic, const double min_freq,
             continue;
         }
         passed++;
-        write_site(ofh, chrom, pos, gene, ref, alt, clsfion, ena_allele, pure_alt, pure_n, bp);
+        write_site(ofh, chrom, pos, gene, ref, alt, clsfion, ena_allele, pure_alt, pure_n, bp, 
+                   samples, ploidy, alt_copies);
 
 
     } // end of file parsing
