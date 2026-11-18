@@ -333,6 +333,10 @@ parse_popmap(const string &pop_file, unordered_map<string, Sample*> &pop_map, ve
             line.pop_back();
         }
 
+        if (line.empty()){
+            continue;
+        }
+
         parse_tabular(line, parts);
 
         if (parts.size() != 3){
@@ -798,6 +802,59 @@ count_allele_copies(const string &field, const uint gt_idx, const uint ploidy, c
 
 }
 
+bool
+passes_missing(const vector<Sample*> &samples, const vector<uint> &ploidy,
+               const vector<int> &alt_copies, const double max_missing){
+
+    //
+    // determine whether the current record has enough samples (based on max_missing)
+    // to consider this informative/useful
+    //
+    // for the Y chrom, females will not be penalized
+    // 
+    // bp = Bear Paw
+    // expected[pop][bp] & missing[pop][bp]
+    // pop: 0 = ENA, 1 = TNP, bp: 0 = "pure", 1 = bear paw
+    //
+    uint expected[2][2] = {{0, 0}, {0,0}};
+    uint missing[2][2]  = {{0, 0}, {0,0}};
+
+    for (uint i = 0; i < samples.size(); i++){
+        Sample *sample = samples[i];
+
+        if (sample == nullptr || ploidy[i] == 0){
+            continue;
+        }
+        uint bp = 0;
+        if (sample->bear_paw == true){
+            bp = 1;
+        }
+        expected[sample->pop][bp]++;
+
+        if (alt_copies[i] < 0){
+            missing[sample->pop][bp]++;
+        }
+
+    } // end of i
+
+    // check if we passed the thresold
+    for (uint i = 0; i < 2; i++){
+        for (uint j = 0; j < 2; j++){
+            if (expected[i][j] == 0){
+                continue;
+            }
+            double frac = (double)missing[i][j] / expected[i][j];
+
+            if (frac > max_missing){
+                return false;
+            }
+        }
+    }
+
+    // we never passed the threshold
+    return true;
+}
+
 void
 tally_genotypes(const vector<string> &parts, const vector<Sample*> &samples, const int gt_idx,
                 const string &chrom, const uint pos, vector<uint> &ploidy, vector<int> &alt_copies,
@@ -902,8 +959,8 @@ classify_site(const string &chrom, const uint pure_alt[2], const uint pure_n[2],
     //
     // classify whether the site is differentiating or there is an informative
     // private allele. 
-    // return 0  -> informative for ENA
-    // return 1  -> informative for TNP
+    // return 0  -> ref belongs to ENA
+    // return 1  -> alt belongs to ENA
     // return -1 -> non-informative
     //
     
@@ -1012,8 +1069,8 @@ write_header(ofstream &fh, const vector<string> &pops){
     
     for (uint i = 0; i < 2; i++){
         string b = "BP_" + pops[i] + '_';
-        fh << '\t'    << b << "homA\t" << b
-           << "het\t" << b << "homB\t" << b
+        fh << '\t'    << b << "homENA\t" << b
+           << "het\t" << b << "homTNP\t" << b
            << "miss";
     }
     fh << '\n';
@@ -1081,7 +1138,7 @@ write_site(ofstream &fh, const string &chrom, const uint pos, const Gene *gene,
 
 int
 parse_vcf(const string &vcf, const bool only_exonic, const double min_freq,
-          const double min_frac, const vector<string> &pops,
+          const double min_frac, const double max_missing, const vector<string> &pops,
           unordered_map<string, Sample*> &pop_map, unordered_map<string, vector<Gene*>> &genome){
 
     //
@@ -1124,7 +1181,7 @@ parse_vcf(const string &vcf, const bool only_exonic, const double min_freq,
     uint   pos, ngenes, furthest;
     bool   keep_reading;
     int    gt_idx, ena_allele;
-    uint valid_sites = 0, snp_sites = 0, informative = 0, passed = 0;
+    uint valid_sites = 0, snp_sites = 0, informative = 0, passed = 0, miss_cnt = 0;
     uint pure_alt[2], pure_n[2]; // per site tallies for "pure" populations
     uint bp[2][4];               // per site bear paw genotype counts
     Gene *gene;
@@ -1244,6 +1301,12 @@ parse_vcf(const string &vcf, const bool only_exonic, const double min_freq,
         // call every sample & count the "pure" populations
         tally_genotypes(parts, samples, gt_idx, chrom, pos, ploidy, alt_copies, pure_alt, pure_n);
 
+        // does this site have enough genotyped individuals
+        if (!passes_missing(samples, ploidy, alt_copies, max_missing)){
+            miss_cnt++;
+            continue;
+        }
+
         // which allele belongs to ENA. -1 if not informative
         clsfion    = Classification::Uinform; 
         ena_allele = classify_site(chrom, pure_alt, pure_n, min_freq, clsfion);
@@ -1274,6 +1337,7 @@ parse_vcf(const string &vcf, const bool only_exonic, const double min_freq,
     }
 
     cerr << "Biallelic SNPs scanned "    << snp_sites << '\n'
+         << "Sites removed for missing data " << miss_cnt << '\n'
          << "Informative sites between " << pops[0]   << " and " << pops[1] << ' ' << informative << '\n'
          << "Sites passing the bear paw check " << passed << '\n';
 
@@ -1282,11 +1346,12 @@ parse_vcf(const string &vcf, const bool only_exonic, const double min_freq,
 
 void
 help(){
-    cerr << "Usage: ./find_bear_paw_hetero_sites -v vcf_file -p popmap.tsv -m <float> -f <float> -a ann.gtf [optional] -g gene_list.txt [optional]\n"
+    cerr << "Usage: ./find_bear_paw_hetero_sites -v vcf_file -p popmap.tsv -m <float> -f <float> -x <float> -a ann.gtf [optional] -g gene_list.txt [optional]\n"
          << "\t-v: vcf file containing the bear paw samples along with the other TNP and ENA stickleback population [required]\n"
          << "\t-p: A population map containing 3 columns: [Sample][Population][Sex] [required]\n"
-         << "\t-m: Minimum frequency of an allele in a population (0.5 <= x <= 1), to consider it differentiated [default: 1.0]\n"
+         << "\t-m: Minimum frequency of an allele in a population (0.5 < x <= 1), to consider it differentiated [default: 1.0]\n"
          << "\t-f: Minimum fraction of Bear Paw Samples to carry the specific mt-Type allele [default: 1.0]\n"
+         << "\t-x: Maximum fraction of missing samples allowed in each group [default: 1.0; no filter]\n"
          << "\t-a: The genome annotation file to overlap SNPs with\n"
          << "\t-g: A file contain the gene_ids (one per line) of interest. Only these genes will be investigated in the annotation\n";
     exit(1);
@@ -1295,7 +1360,7 @@ help(){
 int main(int argc, char *argv[]){
 
     string vcf, ann, pop_file, arg, genes_list;
-    double min_freq = 1.0, min_frac = 1.0;
+    double min_freq = 1.0, min_frac = 1.0, max_missing = 1.0;
     
     // expect at least a single argument
     if (argc < 2){
@@ -1344,6 +1409,20 @@ int main(int argc, char *argv[]){
             }
             catch (const std::invalid_argument &e){
                 cerr << "Error: -f must be a float. Encountered " << argv[i + 1] << '\n';
+                exit(EXIT_FAILURE);
+            }
+        }
+        else if (arg == "-x" && i + 1 < argc){
+            try {
+                max_missing = stod(argv[i + 1]);
+
+                if (max_missing < 0 || max_missing > 1.0){
+                    cerr << "Error: -x must be a value within 0 and 1.0\n";
+                    exit(EXIT_FAILURE);
+                }
+            }
+            catch (const std::invalid_argument &e){
+                cerr << "Error: -x must be a float. Encountered " << argv[i + 1] << '\n';
                 exit(EXIT_FAILURE);
             }
         }
@@ -1397,7 +1476,7 @@ int main(int argc, char *argv[]){
     parse_popmap(pop_file, pop_map, pops);
     
     // parse the vcf file
-    parse_vcf(vcf, use_ann, min_freq, min_frac, pops, pop_map, genome);
+    parse_vcf(vcf, use_ann, min_freq, min_frac, max_missing, pops, pop_map, genome);
 
     // we are done
     clean_up(genome, pop_map);
