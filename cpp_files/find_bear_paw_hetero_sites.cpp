@@ -46,8 +46,9 @@ enum mtType {
 };
 
 enum Classification {
-    Diff    = 0,
-    Private = 1,
+    Uinform = 0, // un-informative
+    Diff    = 1,
+    Private = 2,
 };
 struct Exon {
     uint start;
@@ -327,6 +328,11 @@ parse_popmap(const string &pop_file, unordered_map<string, Sample*> &pop_map, ve
     char sex;
 
     while (getline(fh, line)){
+
+        while (!line.empty() && line.back() == '\r'){
+            line.pop_back();
+        }
+
         parse_tabular(line, parts);
 
         if (parts.size() != 3){
@@ -345,7 +351,7 @@ parse_popmap(const string &pop_file, unordered_map<string, Sample*> &pop_map, ve
                  << " Offending line:\n" << line;
             exit(EXIT_FAILURE);
         }
-        bear_paw = sample.compare(0, BP_PREFIX.size(), BP_PREFIX);
+        bear_paw = sample.compare(0, BP_PREFIX.size(), BP_PREFIX) == 0;
         mtType m = pop == "ENA" ? mtType::ENA : mtType::TNP;
         Sex    s = sex == 'M' ? Sex::Male : Sex::Female;
         pop_map[sample] = new Sample{m, s, bear_paw};
@@ -550,7 +556,8 @@ parse_annotation(const string &ann, unordered_map<string, vector<Gene*>> &genome
         for (auto jtr = genes.begin(); jtr != genes.end(); jtr++){
 
             if (!jtr->second->is_coding()){
-                continue; // skip non-coding genes
+                delete jtr->second; // free the memory
+                continue;           // skip non-coding genes
             }
             jtr->second->resolve_exons(); // collapse & merge exons
             chrom_genes.push_back(jtr->second);
@@ -717,6 +724,109 @@ is_biallelic(const string &ref, const string &alt){
     return true;
 }
 
+int
+expected_ploidy(const string &chrom, const uint pos, const Sex sex){
+    //
+    // return the number of expected alleles at this site
+    //
+
+    if (chrom == MT){
+        return 1; // all samples should be haploid
+    }
+    if (chrom == Y){
+        return sex == Sex::Male ? 1 : 0;
+    }
+    if (chrom == X && pos > PAR_END && sex == Sex::Male){
+        return 1; // only applies to males
+    }
+
+    return 2;
+}
+
+int
+count_allele_copies(const string &field, const uint gt_idx, const uint ploidy, const int allele){
+
+    //
+    // count the copies of allele (0 == ref, 1 = alt) for this genotype
+    // return -1 when the call is missing or does not match the expected
+    // ploidy
+    //
+
+    if (ploidy == 0){
+        return -1; // no call should be made here
+    }
+
+    //
+    //
+    // walk to the GT subfield
+    //
+    uint start = 0, idx = 0, length = field.size();
+
+    while (idx < gt_idx && start < length){
+        if (field[start] == ':'){
+            idx++;
+        }
+        start++;
+    }
+
+    if (idx < gt_idx){
+        cerr << "Encountered a truncated field\n";
+        return -1; // should not happen (truncated sample field)
+    }
+
+    //
+    // collect the alleles by constructing
+    // an array of size 2 (assumes biallelic sites)
+    //
+    int alleles[2];
+    uint ncalled = 0;
+
+    for (uint i = start; i < length && field[i] != ':'; i++){
+        char c = field[i];
+        if (c == '/' || c == '|'){
+            continue;
+        }
+        if (c != '0' && c != '1'){
+            return -1; // missing ('.') or unexpected allele
+        }
+        if (ncalled == 2){
+            cerr << "Encountered a sample with >2 alleles\n";
+            return -1; // should not happen
+        }
+        alleles[ncalled++] = c - '0';
+    } // end of i
+
+    if (ncalled == 0){
+        cerr << "Encountered a sample with no alleles but expected?\n";
+        return -1; // 
+    }
+
+    if (ploidy == 1){
+        if (ncalled == 2 && alleles[0] != alleles[1]){
+            cerr << "Encountered a heterozygous call in a haploid region\n";
+            return -1;
+        }
+        return alleles[0] == allele ? 1 : 0;
+    }
+    if (ncalled != 2){
+        cerr << "Encountered a haploid call in a heterozygous region\n";
+        return -1;
+    }
+
+    //
+    // count the number of copies
+    //
+    int copies = 0;
+    for (uint i = 0; i < 2; i++){
+        if (alleles[i] == allele){
+            copies++;
+        }
+    }
+
+    return copies;
+
+}
+
 void
 tally_genotypes(const vector<string> &parts, const vector<Sample*> &samples, const int gt_idx,
                 const string &chrom, const uint pos, vector<uint> &ploidy, vector<int> &alt_copies,
@@ -826,7 +936,7 @@ classify_site(const string &chrom, const uint pure_alt[2], const uint pure_n[2],
     // return -1 -> non-informative
     //
     
-    if (pure_n[0] == 0 || pure_n[1] == 1){
+    if (pure_n[0] == 0 || pure_n[1] == 0){
         return -1; // no calls ine one of the "pure" populations
     }
 
@@ -873,26 +983,6 @@ classify_site(const string &chrom, const uint pure_alt[2], const uint pure_n[2],
     return -1;
 }
 
-
-int
-expected_ploidy(const string &chrom, const uint pos, const Sex sex){
-    //
-    // return the number of expected alleles at this site
-    //
-
-    if (chrom == MT){
-        return 1; // all samples should be haploid
-    }
-    if (chrom == Y){
-        return sex == Sex::Male ? 1 : 0;
-    }
-    if (chrom == X && pos > PAR_END && sex == Sex::Male){
-        return 1; // only applies to males
-    }
-
-    return 2;
-}
-
 int
 find_gt_index(const string &format){
 
@@ -917,90 +1007,6 @@ find_gt_index(const string &format){
     return -1;
 }
 
-int
-count_allele_copies(const string &field, const uint gt_idx, const uint ploidy, const int allele){
-
-    //
-    // count the copies of allele (0 == ref, 1 = alt) for this genotype
-    // return -1 when the call is missing or does not match the expected
-    // ploidy
-    //
-
-    if (ploidy == 0){
-        return -1; // no call should be made here
-    }
-
-    //
-    //
-    // walk to the GT subfield
-    //
-    uint start = 0, idx = 0, length = field.size();
-
-    while (idx < gt_idx && start < length){
-        if (field[start] == ':'){
-            idx++;
-        }
-        start++;
-    }
-
-    if (idx < gt_idx){
-        cerr << "Encountered a truncated field\n";
-        return -1; // should not happen (truncated sample field)
-    }
-
-    //
-    // collect the alleles by constructing
-    // an array of size 2 (assumes biallelic sites)
-    //
-    int alleles[2];
-    uint ncalled = 0;
-
-    for (uint i = start; i < length && field[i] != ':'; i++){
-        char c = field[i];
-        if (c == '/' || c == '|'){
-            continue;
-        }
-        if (c != '0' && c != '1'){
-            return -1; // missing ('.') or unexpected allele
-        }
-        if (ncalled == 2){
-            cerr << "Encountered a sample with >2 alleles\n";
-            return -1; // should not happen
-        }
-        alleles[ncalled++] = c - '0';
-    } // end of i
-
-    if (ncalled == 0){
-        cerr << "Encountered a sample with no alleles but expected?\n";
-        return -1; // 
-    }
-
-    if (ploidy == 1){
-        if (ncalled == 2 && alleles[0] != alleles[1]){
-            cerr << "Encountered a heterozygous call in a haploid region\n";
-            return -1;
-        }
-        return alleles[0] == allele ? 1 : 0;
-    }
-    if (ncalled != 2){
-        cerr << "Encountered a haploid call in a heterozygous region\n";
-        return -1;
-    }
-
-    //
-    // count the number of copies
-    //
-    int copies = 0;
-    for (uint i = 0; i < 2; i++){
-        if (alleles[i] == allele){
-            copies++;
-        }
-    }
-
-    return copies;
-
-}
-
 bool
 is_informative(const uint bp[2][4], const double min_frac){
 
@@ -1018,10 +1024,90 @@ is_informative(const uint bp[2][4], const double min_frac){
     }
 
     double frac_ena = (double)(bp[0][0] + bp[0][1]) / called_ena;
-    double frac_tnp = (double)(bp[1][0] + bp[1][1]) / called_tnp;
+    double frac_tnp = (double)(bp[1][2] + bp[1][1]) / called_tnp;
 
     return (frac_ena >= min_frac) && (frac_tnp >= min_frac);
 }
+
+void
+write_header(ofstream &fh, const vector<string> &pops){
+    //
+    // write the column headers for the output tsv
+    //
+    fh << "#Chrom\tBP\tGene_id\tRef\tAlt\tClass\t"
+       << pops[0] << "_allele\t"   << pops[1] << "_allele\t"
+       << pops[0] << "_freq\t"     << pops[1] << "_freq\t"
+       << pops[0] << "_nalleles\t" << pops[1] << "_nalleles";
+    
+    for (uint i = 0; i < 2; i++){
+        string b = "BP_" + pops[i] + '_';
+        fh << '\t'    << b << "homA\t" << b
+           << "het\t" << b << "homB\t" << b
+           << "miss";
+    }
+    fh << '\n';
+}
+
+void
+write_site(ofstream &fh, const string &chrom, const uint pos, const Gene *gene,
+           const string &ref, const string &alt, const Classification c,
+           const int ena_allele, const uint pure_alt[2], const uint pure_n[2],
+           const uint bp[2][4]){
+    //
+    // write a passing site to the output tsv
+    // freqs are of the ENA allele in pure ENA &
+    // the TNP allele in pure TNP
+    //
+
+    double alt_freq_ena = (double)pure_alt[0] / pure_n[0];
+    double alt_freq_tnp = (double)pure_alt[1] / pure_n[1];
+
+    string ena_base, tnp_base;
+    double ena_freq, tnp_freq;
+
+    if (ena_allele == 1){
+        ena_base = alt;
+        tnp_base = ref;
+        ena_freq = alt_freq_ena;
+        tnp_freq = 1.0 - alt_freq_tnp;
+    }
+    else {
+        ena_base = ref;
+        tnp_base = alt;
+        ena_freq = 1.0 - alt_freq_ena;
+        tnp_freq = alt_freq_tnp;
+    }
+
+    string c_label;
+    if (c == Classification::Diff){
+        c_label = "DIFF";
+    }
+    else if (c == Classification::Private){
+        c_label = "PRIVATE";
+    }
+    else {
+        c_label = "UNINFORMATIVE"; // should not happen
+    }
+
+    string gene_id = ".";
+    if (gene != nullptr){
+        gene_id = gene->id;
+    }
+
+    fh << chrom    << '\t' << pos      << '\t' << gene_id << '\t'
+       << ref      << '\t' << alt      << '\t' << c_label << '\t'
+       << ena_base << '\t' << tnp_base << '\t'
+       << ena_freq << '\t' << tnp_freq << '\t'
+       << pure_n[0] << '\t' << pure_n[1];
+
+    for (uint i = 0; i < 2; i++){
+        for (uint j = 0; j < 4; j++){
+            fh << '\t' << bp[i][j];
+        }
+    }
+    fh << '\n';
+}
+
 int
 parse_vcf(const string &vcf, const bool only_exonic, const double min_freq,
           const double min_frac, const vector<string> &pops,
@@ -1031,12 +1117,27 @@ parse_vcf(const string &vcf, const bool only_exonic, const double min_freq,
     // this function will be the main work horse for this
     // code
     //
+    //  1. allele frequencies in non-bear paw ENA & TNP samples
+    //     define which allele belongs to ENA and which to B
+    //  2. Bear Paw ENA samples must have a ENA allele (not homo TNP)
+    //     & Bear Paw TNP samples must have a TNP allele (not homo ENA) 
+    //
 
     bool gzipped = is_compressed(vcf);
     gzFile gz_fh = NULL;
     ifstream txt_fh;
 
     open_in_filestream(gzipped, gz_fh, txt_fh, vcf);
+
+    ofstream ofh("Bear_Paw_info_sites.tsv");
+
+    if (!ofh.is_open()){
+        cerr << "Error: Unable to create the output file in this directory\n";
+        exit(EXIT_FAILURE);
+    }
+
+    ofh << std::fixed << setprecision(3);
+    write_header(ofh, pops);
     
     //
     // sample -> pointer to Sample structs with pop & sex info
@@ -1050,11 +1151,12 @@ parse_vcf(const string &vcf, const bool only_exonic, const double min_freq,
     Classification clsfion;
     string line, sample, chrom, curChrom;
     uint   pos, ngenes, furthest;
-    bool   keep_reading, valid;
+    bool   keep_reading;
     int    gt_idx, ena_allele;
     uint valid_sites = 0, snp_sites = 0, informative = 0, passed = 0;
     uint pure_alt[2], pure_n[2]; // per site tallies for "pure" populations
     uint bp[2][4];               // per site bear paw genotype counts
+    Gene *gene;
 
     while (true){
         keep_reading = read_line(gzipped, gz_fh, txt_fh, line);
@@ -1085,14 +1187,19 @@ parse_vcf(const string &vcf, const bool only_exonic, const double min_freq,
                         cerr << "Skipping " << sample << " in this analysis\n";
                         samples.push_back(nullptr);
                     }
-                    samples.push_back(pop_map[sample]);
+                    else {
+                        samples.push_back(pop_map[sample]);
+                    }
                 }
+                ploidy.resize(samples.size());
+                alt_copies.resize(samples.size());
             }
             continue;
         }
 
         if (samples.empty()){
             cerr << "Error: Could not find #CHROM header containg sample information\n";
+            ofh.close();
             exit(1);
         }
 
@@ -1106,9 +1213,16 @@ parse_vcf(const string &vcf, const bool only_exonic, const double min_freq,
         }
         parse_tabular(line, parts);
 
+        if (parts.size() != samples.size() + 9){
+            cerr << "Error: Malformed vcf record. Expected " << samples.size() + 9
+                 << " columns. Offending line:\n" << line << '\n';
+            ofh.close();
+            exit(EXIT_FAILURE);
+        }
 
         chrom = parts[0];
-        valid = true;
+        pos   = (uint)stoi(parts[1]);
+        gene  = nullptr;
 
         // if using only genes, confirm that it is exonic about the exonic regions
         if (only_exonic){ 
@@ -1135,32 +1249,62 @@ parse_vcf(const string &vcf, const bool only_exonic, const double min_freq,
             }
             
             // check if this position is exonic
-            pos = (uint)stoi(parts[1]);
-
-            // this is not an exonic site
-            if (!is_exonic(pos, genes, gene_ends)){
-                valid = false;
-                // continue;
+            gene = is_exonic(pos, genes, gene_ends);
+            if (gene == nullptr){
+                continue;
             }
-            else {
-                valid_sites++;
-            }
+            valid_sites++;
         }
+        
+        // only focusing on biallelic sites
+        const string &ref = parts[3];
+        const string &alt = parts[4];
 
-        if (!valid){
+        if (!is_biallelic(ref, alt)){
             continue;
         }
+        snp_sites++;
+
+        gt_idx = find_gt_index(parts[8]);
+        if (gt_idx == -1){
+            continue; // no genotypes for this record
+        }
+
+        // call every sample & count the "pure" populations
+        tally_genotypes(parts, samples, gt_idx, chrom, pos, ploidy, alt_copies, pure_alt, pure_n);
+
+        // which allele belongs to ENA. -1 if not informative
+        clsfion    = Classification::Uinform; 
+        ena_allele = classify_site(chrom, pure_alt, pure_n, min_freq, clsfion);
+
+        if (ena_allele == -1){
+            continue;;
+        }
+
+        informative++;
+
+        // does the bear paw samples carry their mtDNA's type?
+        tally_bear_paw(samples, ploidy, alt_copies, ena_allele, bp);
+
+        if (!is_informative(bp, min_frac)){
+            continue;
+        }
+        passed++;
+        write_site(ofh, chrom, pos, gene, ref, alt, clsfion, ena_allele, pure_alt, pure_n, bp);
 
 
     } // end of file parsing
 
     close_in_filestream(gzipped, gz_fh, txt_fh);
+    ofh.close();
 
     if (only_exonic){
         cerr << "Total exonic sites scanned " << valid_sites << '\n';
     }
 
-    cerr << std::fixed << setprecision(3);
+    cerr << "Biallelic SNPs scanned "    << snp_sites << '\n'
+         << "Informative sites between " << pops[0]   << " and " << pops[1] << ' ' << informative << '\n'
+         << "Sites passing the bear paw check " << passed << '\n';
 
     return 0;
 }
@@ -1208,8 +1352,8 @@ int main(int argc, char *argv[]){
             try {
                 min_freq = stod(argv[i + 1]);
 
-                if (min_freq < 0.5 || min_freq > 1.0){
-                    cerr << "Error: -m must be a value within 0.5 and 1.0\n";
+                if (min_freq <= 0.5 || min_freq > 1.0){
+                    cerr << "Error: -m must be a value greater than 0.5 and at most 1.0\n";
                     exit(EXIT_FAILURE);
                 }
             }
@@ -1268,6 +1412,7 @@ int main(int argc, char *argv[]){
         if (only_targets){
             if (!file_exists(genes_list)){
                 cerr << "Unable to find " << genes_list << '\n';
+                exit(EXIT_FAILURE);
             }
         }
         unordered_set<string> target_genes;
