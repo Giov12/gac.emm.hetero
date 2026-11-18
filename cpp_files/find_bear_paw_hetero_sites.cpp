@@ -628,35 +628,6 @@ clean_up(unordered_map<string, vector<Gene*>> &genome, unordered_map<string, Sam
     return 0;
 }
 
-int
-is_hetero(string &geno){
-    
-    // return 1 if this is a heterozygous
-    // genotype, else 0
-
-    if (geno.empty()){
-        cerr << "Error: Encountered a not a valid genotype call\n";
-        exit(1);
-    }
-
-    string a1, a2;
-    uint start = 0, end = 0, length = geno.size();
-
-    while (end < length){
-        if (geno[end] == '/' || geno[end] == '|'){
-            if (a1.empty()){
-                a1 = geno.substr(start, end - start);
-            }
-            start = end + 1;
-        }
-        end++;
-    }
-
-    a2 = geno.substr(start);
-
-    return a1 == a2 ? 0 : 1;
-}
-
 Gene *
 is_exonic(const uint pos, vector<Gene*>*genes, vector<uint> &gene_ends){
     //
