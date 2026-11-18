@@ -470,7 +470,7 @@ parse_annotation(const string &ann, unordered_map<string, vector<Gene*>> &genome
     Gene *g;
     string line, chrom, gene_id, gene_name;
     uint start, end;
-    bool eof = false, keep_reading;
+    bool keep_reading;
 
     while (true){
         keep_reading = read_line(gzipped, gz_fh, txt_fh, line);
