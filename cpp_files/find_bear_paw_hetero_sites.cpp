@@ -73,6 +73,12 @@ struct Attribute {
     string val;
 };
 
+struct Sample {
+    mtType pop;
+    Sex    sex;
+    bool   bear_paw;
+};
+
 class Gene {
 private:
     bool _coding = false;
@@ -237,12 +243,6 @@ public:
         return this->_coding;
     }
  
-};
-
-struct Sample {
-    mtType pop;
-    Sex  sex;
-    bool bear_paw;
 };
 
 //
@@ -1130,7 +1130,49 @@ find_gt_index(const string &format){
 }
 
 bool
-is_informative(const uint bp[2][4], const double min_frac){
+shares_homozygotes(const vector<Sample*> &samples, const vector<uint> &ploidy,
+                   const vector<int> &alt_copies){
+
+    //
+    // helper function to enfoce that the TNP and ENA populations have a homozygous
+    // individual for the same allele. For example, both TNP and ENA can have an A/A individual
+    //
+
+    uint hom_ref[2] = {0, 0};
+    uint hom_alt[2] = {0, 0};
+
+    for (uint i = 0; i < samples.size(); i++){
+        Sample *sample = samples[i];
+
+        if (sample == nullptr || sample->bear_paw || ploidy[i] == 0){
+            continue;
+        }
+
+        if (alt_copies[i] == -1){
+            continue; // missing data
+        }
+
+        if (alt_copies[i] == 0){
+            hom_ref[sample->pop]++;
+        }
+        else if (alt_copies[i] == (int)ploidy[i]){
+            hom_alt[sample->pop]++;
+        }
+    } // end of i
+
+    if (hom_ref[0] > 0 && hom_ref[1] > 0){
+        return true;
+    }
+    else if (hom_alt[0] > 0 && hom_alt[1] > 0){
+        return true;
+    }
+
+    return false;
+}
+
+bool
+is_informative(const uint bp[2][4], const double min_frac, const Classification c,
+               const int ena_allele, const uint pure_alt[2], const uint pure_n[2]){
 
     //
     // helper function to determine if this site is informative
@@ -1145,8 +1187,45 @@ is_informative(const uint bp[2][4], const double min_frac){
         return false; // can't evaluate
     }
 
-    double frac_ena = (double)(bp[0][0] + bp[0][1]) / called_ena;
-    double frac_tnp = (double)(bp[1][2] + bp[1][1]) / called_tnp;
+    // hom or het for their type's allele counts as carrying it
+    uint ena_carriers = bp[0][0] + bp[0][1];
+    uint tnp_carriers = bp[1][2] + bp[1][1];
+
+    //
+    // be stricter on private alleles. If the genotypes
+    // between the two "pure" populations can be found, 
+    // we will not consider the site anymore
+    //
+
+    if (c == Classification::Private){
+         //
+        // find which population holds the private allele
+        // the other population has 0 copies of it
+        //
+        uint ena_copies_in_tnp; // copies of the ENA allele in pure TNP
+        uint tnp_copies_in_ena; // copies of the TNP allele in pure ENA
+
+        if (ena_allele == 1){ // alt is ENA's allele
+            ena_copies_in_tnp = pure_alt[1];
+            tnp_copies_in_ena = pure_n[0] - pure_alt[0];
+        }
+        else { // ref is ENA's allele
+            ena_copies_in_tnp = pure_n[1] - pure_alt[1];
+            tnp_copies_in_ena = pure_alt[0];
+        }
+
+        if (tnp_copies_in_ena == 0){
+            // private allele is in TNP, so BP ENA must be hom ENA
+            ena_carriers = bp[0][0];
+        }
+        else if (ena_copies_in_tnp == 0){
+            // private allele is in ENA, so BP TNP must be hom TNP
+            tnp_carriers = bp[1][2];
+        }
+    }
+
+    double frac_ena = (double)ena_carriers / called_ena;
+    double frac_tnp = (double)tnp_carriers / called_tnp;
 
     return (frac_ena >= min_frac) && (frac_tnp >= min_frac);
 }
@@ -1368,7 +1447,7 @@ parse_vcf(const string &vcf, const bool only_exonic, const double min_freq,
     uint   pos, ngenes, furthest;
     bool   keep_reading;
     int    gt_idx, ena_allele;
-    uint snp_sites = 0, informative = 0;
+    uint snp_sites = 0, informative = 0, shared_hom = 0;
     uint passed = 0, miss_cnt = 0, exonic_sites = 0, promoter_sites = 0;
     uint pure_alt[2], pure_n[2]; // per site tallies for "pure" populations
     uint bp[2][4];               // per site bear paw genotype counts
@@ -1508,12 +1587,18 @@ parse_vcf(const string &vcf, const bool only_exonic, const double min_freq,
             continue;;
         }
 
+        // ensure that the "pure" populations do not share homozygotes of the same allele
+        if (shares_homozygotes(samples, ploidy, alt_copies)){
+            shared_hom++;
+            continue;
+        }
+
         informative++;
 
         // does the bear paw samples carry their mtDNA's type?
         tally_bear_paw(samples, ploidy, alt_copies, ena_allele, bp);
 
-        if (!is_informative(bp, min_frac)){
+        if (!is_informative(bp, min_frac, clsfion, ena_allele, pure_alt, pure_n)){
             continue;
         }
         passed++;
@@ -1533,6 +1618,7 @@ parse_vcf(const string &vcf, const bool only_exonic, const double min_freq,
 
     cerr << "Biallelic SNPs scanned "    << snp_sites << '\n'
          << "Sites removed for missing data " << miss_cnt << '\n'
+         << "Sites removed for shared homozygotes " << shared_hom << '\n'
          << "Informative sites between " << pops[0]   << " and " << pops[1] << ' ' << informative << '\n'
          << "Sites passing the bear paw check " << passed << '\n';
 
