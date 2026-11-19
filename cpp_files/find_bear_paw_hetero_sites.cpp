@@ -60,9 +60,11 @@ enum RegionType {
 };
 
 enum Classification {
-    Uinform = 0, // un-informative
-    Diff    = 1,
-    Private = 2,
+    Uinform   = 0, // un-informative
+    Diff      = 1,
+    Private   = 2,
+    BpHetSame = 3, // pure pops fixed for the same allele, bear paw het
+    BpHetDiff = 4, // pure pops fixed for different alleles, bear paw het
 };
 struct Exon {
     uint start;
@@ -1106,6 +1108,96 @@ classify_site(const string &chrom, const uint pure_alt[2], const uint pure_n[2],
 }
 
 int
+classify_fixed_pure(const vector<Sample*> &samples, const vector<uint> &ploidy,
+                    const vector<int> &alt_copies, Classification &c){
+
+    //
+    // helper function to determine if the bear paw samples are hetero while
+    // the other pure populations remain homozygous regardless of allele
+    //
+    // fixed[pop]: -1 not seen yet, 0 = ref, 1 = alt
+    //
+
+    int fixed[2] = {-1, -1};
+
+    // tally pure pops only first
+    for (uint i = 0; i < samples.size(); i++){
+        Sample *sample = samples[i];
+
+        if (sample == nullptr || sample->bear_paw || ploidy[i] == 0 || alt_copies[i] == -1){
+            continue;
+        }
+
+        int allele;
+        if (alt_copies[i] == 0){
+            allele = 0; // homo ref
+        }
+        else if (alt_copies[i] == (int)ploidy[i]){
+            allele = 1; // homo alt
+        }
+        else {
+            return -1; // this individual is hetero
+        }
+
+        if (fixed[sample->pop] == -1){
+            fixed[sample->pop] = allele; // assign
+        }
+        else if (fixed[sample->pop] != allele){
+            return -1; // both homozygotes within one population
+        }
+    }
+
+    if (fixed[0] == -1 || fixed[1] == -1){
+        return -1; // no calls
+    }
+
+    if (fixed[0] == fixed[1]){
+        c = Classification::BpHetSame;
+    }
+    else {
+        c = Classification::BpHetDiff; // would be ideal
+    }
+
+    return fixed[0];
+}
+
+bool
+bear_paw_all_het(const vector<Sample*> &samples, const vector<uint> &ploidy,
+                 const vector<int> &alt_copies, const double min_frac){
+    //
+    // helper function to determine if all the bear paw samples are
+    // hetero at this site 
+    //
+
+    uint called[2] = {0, 0};
+    uint het[2]    = {0, 0};
+
+    for (uint i = 0; i < samples.size(); i++){
+        Sample *sample = samples[i];
+        if (sample == nullptr || !sample->bear_paw || ploidy[i] != 2 || alt_copies[i] == -1){
+            continue; // only diploid bear paw samples, haploid, or missing
+        }
+
+        called[sample->pop]++;
+        if (alt_copies[i] == 1){
+            het[sample->pop]++;
+        }
+    }
+
+    for (uint i = 0; i < 2; i++){
+        if (called[i] == 0){
+            return false; // can't evaluate
+        }
+        double frac = (double)het[i] / called[i];
+        if (frac < min_frac){
+            return false;
+        }
+    }
+
+    return true;
+}
+
+int
 find_gt_index(const string &format){
 
     //
@@ -1351,6 +1443,20 @@ write_site(ofstream &fh, const string &chrom, const uint pos, const Gene *gene,
         tnp_freq = alt_freq_tnp;
     }
 
+    if (c == Classification::BpHetSame){
+        //
+        // all non-bear paw samples are fixed
+        // for the same allele
+        //
+        tnp_base = ena_base;
+        if (ena_allele == 1){
+            tnp_freq = alt_freq_tnp;
+        }
+        else {
+            tnp_freq = 1.0 - alt_freq_tnp;
+        }
+    }
+
     string c_label;
     switch (c) {
         case Classification::Diff:
@@ -1359,16 +1465,19 @@ write_site(ofstream &fh, const string &chrom, const uint pos, const Gene *gene,
         case Classification::Private:
             c_label = "PRIVATE";
             break;
+        case Classification::BpHetSame:
+            c_label = "BP_HET_SAME";
+            break;
+        case Classification::BpHetDiff:
+            c_label = "BP_HET_DIFF";
+            break;
         default:
             c_label = "UNINFORMATIVE";
             break;
     }
 
-    string gene_id = ".";
-    if (gene != nullptr){
-        gene_id = gene->id;
-    }
-
+    string gene_id = gene == nullptr ? "." : gene->id ;
+  
     string r_label;
     switch (region) {
         case RegionType::Exonic:
@@ -1397,14 +1506,14 @@ write_site(ofstream &fh, const string &chrom, const uint pos, const Gene *gene,
     fh << '\t' << genotype_summary(samples, ploidy, alt_copies, ref, alt, mtType::ENA, false)
        << '\t' << genotype_summary(samples, ploidy, alt_copies, ref, alt, mtType::ENA, true)
        << '\t' << genotype_summary(samples, ploidy, alt_copies, ref, alt, mtType::TNP, true)
-       << '\t' << genotype_summary(samples, ploidy, alt_copies, ref, alt, mtType::TNP, false) << '\n';
+       << '\t' << genotype_summary(samples, ploidy, alt_copies, ref, alt, mtType::TNP, false)
+       << '\n';
 
 }
 
 int
-parse_vcf(const string &vcf, const bool only_exonic, const double min_freq,
-          const double min_frac, const double max_missing, const vector<string> &pops,
-          unordered_map<string, Sample*> &pop_map, unordered_map<string, vector<Gene*>> &genome){
+parse_vcf(const string &vcf, const double min_freq, const double min_frac, const double max_missing, 
+          const vector<string> &pops, unordered_map<string, Sample*> &pop_map, unordered_map<string, vector<Gene*>> &genome){
 
     //
     // this function will be the main work horse for this
@@ -1447,7 +1556,7 @@ parse_vcf(const string &vcf, const bool only_exonic, const double min_freq,
     uint   pos, ngenes, furthest;
     bool   keep_reading;
     int    gt_idx, ena_allele;
-    uint snp_sites = 0, informative = 0, shared_hom = 0;
+    uint snp_sites = 0, informative = 0, shared_hom = 0, rescued = 0, het_diff = 0;
     uint passed = 0, miss_cnt = 0, exonic_sites = 0, promoter_sites = 0;
     uint pure_alt[2], pure_n[2]; // per site tallies for "pure" populations
     uint bp[2][4];               // per site bear paw genotype counts
@@ -1519,8 +1628,9 @@ parse_vcf(const string &vcf, const bool only_exonic, const double min_freq,
         pos    = (uint)stoi(parts[1]);
         gene   = nullptr;
         region = RegionType::NoRegion;
+
         // if using only genes, confirm that it is exonic about the exonic regions
-        if (only_exonic){ 
+        if (!genome.empty()){ 
 
             if (genome.count(chrom) == 0){
                 continue; // no genes on this chrom
@@ -1583,14 +1693,37 @@ parse_vcf(const string &vcf, const bool only_exonic, const double min_freq,
         clsfion    = Classification::Uinform; 
         ena_allele = classify_site(chrom, pure_alt, pure_n, min_freq, clsfion);
 
-        if (ena_allele == -1){
-            continue;;
+        // can we rescue this site?
+        if (ena_allele != -1 && shares_homozygotes(samples, ploidy, alt_copies)){
+            shared_hom++;
+            ena_allele = -1; // no longer reportable as DIFF/PRIVATE
         }
 
-        // ensure that the "pure" populations do not share homozygotes of the same allele
-        if (shares_homozygotes(samples, ploidy, alt_copies)){
-            shared_hom++;
+        if (ena_allele == -1){
+            //
+            // we can attempt to rescue this hit if Bear Paw is
+            // hetero while other pops are pure
+            //
+            if (chrom == MT || chrom == Y){
+                continue; // haploid site
+            }
+            clsfion    = Classification::Uinform;
+            ena_allele = classify_fixed_pure(samples, ploidy, alt_copies, clsfion);
+
+            if (ena_allele == -1){
+                continue; // a pure pop is not fixed
+            }
+
+            if (!bear_paw_all_het(samples, ploidy, alt_copies, min_frac)){
+                continue;
+            }
+
+            rescued++;
+            tally_bear_paw(samples, ploidy, alt_copies, ena_allele, bp);
+            write_site(ofh, chrom, pos, gene, region, ref, alt, clsfion, ena_allele, pure_alt, pure_n, bp,
+                       samples, ploidy, alt_copies);
             continue;
+            
         }
 
         informative++;
@@ -1602,6 +1735,23 @@ parse_vcf(const string &vcf, const bool only_exonic, const double min_freq,
             continue;
         }
         passed++;
+
+        //
+        // a fixed difference where the bear paw samples are
+        // heterozygous gets its own label (BP_HET_DIFF)
+        //
+        if (clsfion == Classification::Diff){
+            Classification fixed_c = Classification::Uinform;
+            int fixed_allele       = classify_fixed_pure(samples, ploidy, alt_copies, fixed_c);
+
+            if (fixed_allele != -1 && fixed_c == Classification::BpHetDiff){
+                if (bear_paw_all_het(samples, ploidy, alt_copies, min_frac)){
+                    clsfion = Classification::BpHetDiff;
+                    het_diff++;
+                }
+            }
+        }
+
         write_site(ofh, chrom, pos, gene, region, ref, alt, clsfion, ena_allele, pure_alt, pure_n, bp, 
                    samples, ploidy, alt_copies);
 
@@ -1611,7 +1761,7 @@ parse_vcf(const string &vcf, const bool only_exonic, const double min_freq,
     close_in_filestream(gzipped, gz_fh, txt_fh);
     ofh.close();
 
-    if (only_exonic){
+    if (!genome.empty()){
         cerr << "Total exonic sites scanned "   << exonic_sites   << '\n'
              << "Total promoter sites scanned " << promoter_sites << '\n';
     }
@@ -1620,7 +1770,9 @@ parse_vcf(const string &vcf, const bool only_exonic, const double min_freq,
          << "Sites removed for missing data " << miss_cnt << '\n'
          << "Sites removed for shared homozygotes " << shared_hom << '\n'
          << "Informative sites between " << pops[0]   << " and " << pops[1] << ' ' << informative << '\n'
-         << "Sites passing the bear paw check " << passed << '\n';
+         << "Sites passing the bear paw check " << passed << '\n'
+         << "  of which fixed differences with heterozygous bear paw (BP_HET_DIFF) " << het_diff << '\n'
+         << "Sites rescued (pure populations fixed, bear paw heterozygous) " << rescued << '\n';
 
     return 0;
 }
@@ -1776,7 +1928,7 @@ int main(int argc, char *argv[]){
     parse_popmap(pop_file, pop_map, pops);
     
     // parse the vcf file
-    parse_vcf(vcf, use_ann, min_freq, min_frac, max_missing, pops, pop_map, genome);
+    parse_vcf(vcf, min_freq, min_frac, max_missing, pops, pop_map, genome);
 
     // we are done
     clean_up(genome, pop_map);
