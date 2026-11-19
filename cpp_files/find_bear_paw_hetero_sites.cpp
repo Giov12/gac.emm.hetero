@@ -9,6 +9,8 @@
 #include <unordered_map>
 #include <unordered_set>
 #include <stdexcept>
+#include <cmath>
+#include <random>
 
 using std::string;
 using std::fstream;
@@ -37,6 +39,57 @@ using std::stoi;
 
 typedef unsigned int uint;
 
+//
+// LD analysis was adapted from Kuster et al. (2025)
+//  Kuster, S. A., Schumer, M., Havird, J., & Sloan, D. B. (2026). 
+//  Sensitivity of genome-wide tests for mitonuclear genetic incompatibilities. 
+//  Philosophical transactions of the Royal Society of London. Series B, Biological sciences, 381(1947), 20250084. 
+//
+//
+// mitonuclear linkage disequilibrium (LD) within bear paw
+//
+// A = the nuclear ENA allele (defined by the pure populations)
+// B = the ENA mitotype (from the popmap)
+// every nuclear allele copy is paired with its fish's mitotype,
+// so no phasing is needed
+//
+//   D  = pAB - pA * pB
+//   D' = D / Dmax
+//   r2 = D^2 / (pA (1 - pA) pB (1 - pB))
+//
+// D > 0 -> matched (parental) combinations are more common
+// D < 0 -> mismatched combinations are more common
+//
+
+const double MAX_EXACT_PERMS = 100000; // enumerate every relabeling up to this many
+const uint   N_RANDOM_PERMS  = 10000;  // otherwise use random relabelings
+const double PERM_TOL        = 1e-12;  // tolerance when comparing |D| values
+
+struct MitoLD {
+    uint   n_ena     = 0;  // allele copies in bear paw ENA fish
+    uint   n_tnp     = 0;  // allele copies in bear paw TNP fish
+    double q_ena     = 0;  // ENA allele freq in bear paw ENA fish
+    double q_tnp     = 0;  // ENA allele freq in bear paw TNP fish
+    double p_b       = 0;  // fraction of allele copies from ENA mitotype fish
+    double d         = 0;
+    double d_prime   = 0;
+    double r2        = 0;
+    double p_perm    = 1;  // two sided permutation p-value for D
+    uint   n_perm    = 0;  // number of relabelings used
+    bool   exact     = true;
+    bool   valid     = false; // can LD be computed at all
+    bool   dp_valid  = false; // is D' defined
+    bool   r2_valid  = false; // is r2 defined
+
+    // heterozygosity in all diploid bear paw calls
+    uint   n_dip     = 0;
+    double ho        = 0;
+    double he        = 0;
+    double fis       = 0;
+    bool   fis_valid = false;
+};
+
+
 enum Sex {
     Male   = 0,
     Female = 1
@@ -56,7 +109,7 @@ enum mtType {
 enum RegionType {
     NoRegion = 0,
     Exonic   = 1,
-    promoter = 2
+    Promoter = 2
 };
 
 enum Classification {
@@ -774,7 +827,7 @@ is_candidate_region(const uint pos, vector<Gene*>*genes, vector<uint> &gene_ends
     }
 
     if (promoter_hit != nullptr){
-        region = RegionType::promoter;
+        region = RegionType::Promoter;
     }
 
     return promoter_hit; // this may never change from nullptr
@@ -1322,6 +1375,225 @@ is_informative(const uint bp[2][4], const double min_frac, const Classification 
     return (frac_ena >= min_frac) && (frac_tnp >= min_frac);
 }
 
+double
+ld_d(const int group_a, const int group_n, const int total_a, const int total_n){
+
+    //
+    // calculate D (D = pAB - pA * pB)
+    // group_a: ENA allele copies in the fish labeled ENA mitotype
+    // group_n: all allele copies in the fish labeled ENA mitotype
+    //
+
+    double p_a  = (double)total_a / total_n;
+    double p_b  = (double)group_n / total_n;
+    double p_ab = (double)group_a / total_n;
+
+    return p_ab - p_a * p_b;
+}
+
+double
+n_choose_k(const uint n, const uint k){
+
+    //
+    // number of ways to choose k of n, as a double to avoid overflow
+    //
+    double result = 1;
+    for (uint i = 1; i <= k; i++){
+        result = result * (n - k + i) / i;
+    }
+    return result;
+}
+
+void
+mitonuclear_ld(const vector<Sample*> &samples, const vector<uint> &ploidy,
+               const vector<int> &alt_copies, const int ena_allele, MitoLD &ld){
+
+    //
+    // compute the LD between the nuclear ENA allele & the ENA mitotype
+    // in the bear paw samples, along with a permutation test where
+    // the mitotype labels are shuffled among the called bear paw fish
+    //
+
+    ld = MitoLD(); // reset
+
+    // collect the called bear paw fish
+    vector<int>  a_copies; // ENA allele copies per fish
+    vector<int>  n_copies; // allele copies per fish (ploidy)
+    vector<bool> is_ena;   // ENA mitotype?
+    uint het = 0, dip_alt = 0;
+
+    for (uint i = 0; i < samples.size(); i++){
+        Sample *sample = samples[i];
+        if (sample == nullptr || !sample->bear_paw || ploidy[i] == 0){
+            continue;
+        }
+        if (alt_copies[i] < 0){
+            continue; // missing
+        }
+
+        int ena_copies;
+        if (ena_allele == 1){
+            ena_copies = alt_copies[i];
+        }
+        else {
+            ena_copies = (int)ploidy[i] - alt_copies[i];
+        }
+
+        a_copies.push_back(ena_copies);
+        n_copies.push_back((int)ploidy[i]);
+
+        if (sample->pop == mtType::ENA){
+            is_ena.push_back(true);
+            ld.n_ena += ploidy[i];
+        }
+        else {
+            is_ena.push_back(false);
+            ld.n_tnp += ploidy[i];
+        }
+
+        // heterozygosity only uses diploid calls
+        if (ploidy[i] == 2){
+            ld.n_dip++;
+            dip_alt += alt_copies[i];
+            if (alt_copies[i] == 1){
+                het++;
+            }
+        }
+    }
+
+    // observed & expected heterozygosity
+    if (ld.n_dip > 0){
+        double p = (double)dip_alt / (2 * ld.n_dip);
+        ld.ho    = (double)het / ld.n_dip;
+        ld.he    = 2 * p * (1 - p);
+        if (ld.he > 0){
+            ld.fis       = 1 - ld.ho / ld.he;
+            ld.fis_valid = true;
+        }
+    }
+
+    if (ld.n_ena == 0 || ld.n_tnp == 0){
+        return; // need both mitotypes
+    }
+
+    // observed sums
+    const uint nfish = a_copies.size();
+    int total_a = 0, total_n = 0, ena_a = 0, ena_k = 0;
+    for (uint i = 0; i < nfish; i++){
+        total_a += a_copies[i];
+        total_n += n_copies[i];
+        if (is_ena[i]){
+            ena_a += a_copies[i];
+            ena_k++;
+        }
+    }
+
+    ld.valid = true;
+    ld.q_ena = (double)ena_a / ld.n_ena;
+    ld.q_tnp = (double)(total_a - ena_a) / ld.n_tnp;
+
+    double p_a = (double)total_a / total_n;
+    ld.p_b     = (double)ld.n_ena / total_n;
+    ld.d       = ld_d(ena_a, ld.n_ena, total_a, total_n);
+
+    // D'
+    double d_max;
+    if (ld.d > 0){
+        d_max = std::min(p_a * (1 - ld.p_b), (1 - p_a) * ld.p_b);
+    }
+    else {
+        d_max = std::min(p_a * ld.p_b, (1 - p_a) * (1 - ld.p_b));
+    }
+    if (d_max > 0){
+        ld.d_prime  = ld.d / d_max;
+        ld.dp_valid = true;
+    }
+
+    // r2
+    double denom = p_a * (1 - p_a) * ld.p_b * (1 - ld.p_b);
+    if (denom > 0){
+        ld.r2       = ld.d * ld.d / denom;
+        ld.r2_valid = true;
+    }
+
+    if (p_a == 0 || p_a == 1){
+        return; // monomorphic in bear paw, D is 0 for every labeling
+    }
+
+    //
+    // permutation test: keep the number of ENA mitotype fish (ena_k)
+    // & relabel which fish they are. two sided on |D|
+    //
+    const double obs   = std::abs(ld.d);
+    const double combs = n_choose_k(nfish, ena_k);
+    uint extreme = 0;
+
+    if (combs <= MAX_EXACT_PERMS){
+        //
+        // exact: every combination of ena_k fish out of nfish
+        // idx holds the chosen fish, in increasing order
+        //
+        vector<uint> idx(ena_k);
+        for (uint i = 0; i < (uint)ena_k; i++){
+            idx[i] = i;
+        }
+
+        while (true){
+            int group_a = 0, group_n = 0;
+            for (uint i = 0; i < (uint)ena_k; i++){
+                group_a += a_copies[idx[i]];
+                group_n += n_copies[idx[i]];
+            }
+            double d = ld_d(group_a, group_n, total_a, total_n);
+            if (std::abs(d) >= obs - PERM_TOL){
+                extreme++;
+            }
+            ld.n_perm++;
+
+            // move to the next combination
+            int j = ena_k - 1;
+            while (j >= 0 && idx[j] == nfish - ena_k + j){
+                j--;
+            }
+            if (j < 0){
+                break; // all combinations done
+            }
+            idx[j]++;
+            for (uint i = j + 1; i < (uint)ena_k; i++){
+                idx[i] = idx[i - 1] + 1;
+            }
+        }
+        ld.p_perm = (double)extreme / ld.n_perm;
+    }
+    else {
+        //
+        // too many fish to enumerate, so shuffle the labels randomly
+        // fixed seed so runs are reproducible
+        //
+        ld.exact = false;
+        static std::mt19937 rng(12345);
+        vector<uint> order(nfish);
+        for (uint i = 0; i < nfish; i++){
+            order[i] = i;
+        }
+
+        for (uint p = 0; p < N_RANDOM_PERMS; p++){
+            std::shuffle(order.begin(), order.end(), rng);
+            int group_a = 0, group_n = 0;
+            for (uint i = 0; i < (uint)ena_k; i++){
+                group_a += a_copies[order[i]];
+                group_n += n_copies[order[i]];
+            }
+            double d = ld_d(group_a, group_n, total_a, total_n);
+            if (std::abs(d) >= obs - PERM_TOL){
+                extreme++;
+            }
+        }
+        ld.n_perm = N_RANDOM_PERMS;
+        ld.p_perm = (double)(extreme + 1) / (N_RANDOM_PERMS + 1);
+    }
+}
+
 void
 write_header(ofstream &fh, const vector<string> &pops){
     //
@@ -1344,6 +1616,35 @@ write_header(ofstream &fh, const vector<string> &pops){
        << '\t' << "BP_"   << pops[0]      << "_genotypes"
        << '\t' << "BP_"   << pops[1]      << "_genotypes"
        << '\t' << pops[1] << "_genotypes" << '\n';
+
+}
+
+void
+write_value(ofstream &fh, const bool valid, const double value){
+
+    //
+    // helper function to write a value, or NA if it is undefined
+    //
+    if (valid){
+        fh << '\t' << value;
+    }
+    else {
+        fh << "\tNA";
+    }
+}
+
+void
+write_ld_header(ofstream &fh, const vector<string> &pops){
+    //
+    // column headers for the mitonuclear LD output
+    //
+    fh << "#Chrom\tBP\tGene_id\tRegion\tRef\tAlt\tClass\tStatus\t"
+       << pops[0] << "_allele\t" << pops[1]          << "_allele\t"
+       << pops[0] << "_freq\t"   << pops[1]          << "_freq\t"
+       << "BP_"   << pops[0]     << "_nalleles\tBP_" << pops[1] << "_nalleles\t"
+       << "BP_"   << pops[0]     << "_q" << pops[0]  << "\tBP_" << pops[1] 
+       << "_q"    << pops[0]     
+       << "\tpB\tD\tD_prime\tr2\tn_perm\tperm_type\tp_perm\tBP_ndiploid\tBP_Ho\tBP_He\tBP_Fis\n";
 
 }
 
@@ -1483,7 +1784,7 @@ write_site(ofstream &fh, const string &chrom, const uint pos, const Gene *gene,
         case RegionType::Exonic:
             r_label = "exon";
             break;
-        case RegionType::promoter:
+        case RegionType::Promoter:
             r_label = "promoter";
             break;
         default:
@@ -1511,8 +1812,78 @@ write_site(ofstream &fh, const string &chrom, const uint pos, const Gene *gene,
 
 }
 
+void
+write_ld_site(ofstream &fh, const string &chrom, const uint pos, const Gene *gene,
+              const RegionType region, const string &ref, const string &alt,
+              const Classification c, const string &status, const int ena_allele,
+              const uint pure_alt[2], const uint pure_n[2], const MitoLD &ld){
+    //
+    // write one site to the mitonuclear LD output
+    //
+
+    string ena_base, tnp_base;
+    double ena_freq, tnp_freq;
+
+    if (ena_allele == 1){
+        ena_base = alt;
+        tnp_base = ref;
+        ena_freq = (double)pure_alt[0] / pure_n[0];
+        tnp_freq = 1.0 - (double)pure_alt[1] / pure_n[1];
+    }
+    else {
+        ena_base = ref;
+        tnp_base = alt;
+        ena_freq = 1.0 - (double)pure_alt[0] / pure_n[0];
+        tnp_freq = (double)pure_alt[1] / pure_n[1];
+    }
+
+    string c_label = c == Classification::Diff ? "DIFF" : "PRIVATE";
+    string gene_id = gene == nullptr ? "." : gene->id;
+    string r_label = ".";
+
+    if (region == RegionType::Exonic){
+        r_label = "exon";
+    }
+    else if (region == RegionType::Promoter){
+        r_label = "promoter";
+    }
+
+    fh << chrom    << '\t' << pos      << '\t' << gene_id << '\t' << r_label << '\t'
+       << ref      << '\t' << alt      << '\t' << c_label << '\t' << status  << '\t'
+       << ena_base << '\t' << tnp_base << '\t' << ena_freq << '\t' << tnp_freq << '\t'
+       << ld.n_ena << '\t' << ld.n_tnp;
+
+    write_value(fh, ld.valid, ld.q_ena);
+    write_value(fh, ld.valid, ld.q_tnp);
+    write_value(fh, ld.valid, ld.p_b);
+    write_value(fh, ld.valid, ld.d);
+    write_value(fh, ld.dp_valid, ld.d_prime);
+    write_value(fh, ld.r2_valid, ld.r2);
+
+    if (ld.n_perm > 0){
+        fh << '\t' << ld.n_perm;
+        if (ld.exact){
+            fh << "\texact";
+        }
+        else {
+            fh << "\trandom";
+        }
+        fh << '\t' << ld.p_perm;
+    }
+    else {
+        fh << "\t0\tNA\tNA";
+    }
+
+    fh << '\t' << ld.n_dip;
+    write_value(fh, ld.n_dip > 0, ld.ho);
+    write_value(fh, ld.n_dip > 0, ld.he);
+    write_value(fh, ld.fis_valid, ld.fis);
+    fh << '\n';
+}
+
+
 int
-parse_vcf(const string &vcf, const double min_freq, const double min_frac, const double max_missing, 
+parse_vcf(const string &vcf, const double min_freq, const double min_frac, const double max_missing, const bool write_ld,
           const vector<string> &pops, unordered_map<string, Sample*> &pop_map, unordered_map<string, vector<Gene*>> &genome){
 
     //
@@ -1540,6 +1911,22 @@ parse_vcf(const string &vcf, const double min_freq, const double min_frac, const
 
     ofh << std::fixed << setprecision(3);
     write_header(ofh, pops);
+
+    // mitonuclear LD output if requested
+    ofstream ld_fh;
+
+    if (write_ld){
+        ld_fh.open("Bear_Paw_mitonuclear_ld.tsv");
+        if (!ld_fh.is_open()){
+            cerr << "Error: Unable to create the LD output file in this directory\n";
+            exit(EXIT_FAILURE);
+        }
+        ld_fh << std::fixed << setprecision(4);
+        write_ld_header(ld_fh, pops);
+    }
+
+    MitoLD ld;
+    uint   ld_sites = 0;
     
     //
     // sample -> pointer to Sample structs with pop & sex info
@@ -1661,7 +2048,7 @@ parse_vcf(const string &vcf, const double min_freq, const double min_frac, const
             if (region == RegionType::Exonic){
                 exonic_sites++;
             }
-            else if (region == RegionType::promoter){
+            else if (region == RegionType::Promoter){
                 promoter_sites++;
             }
         }
@@ -1692,6 +2079,32 @@ parse_vcf(const string &vcf, const double min_freq, const double min_frac, const
         // which allele belongs to ENA. -1 if not informative
         clsfion    = Classification::Uinform; 
         ena_allele = classify_site(chrom, pure_alt, pure_n, min_freq, clsfion);
+
+        //
+        // mitonuclear LD for every informative nuclear site,
+        // before the shared homozygote & bear paw filters.
+        // the Status column says what those filters decided
+        //
+        if (write_ld && ena_allele != -1 && chrom != MT && chrom != Y){
+            string status;
+            if (shares_homozygotes(samples, ploidy, alt_copies)){
+                status = "SHARED_HOM";
+            }
+            else {
+                tally_bear_paw(samples, ploidy, alt_copies, ena_allele, bp);
+                if (is_informative(bp, min_frac, clsfion, ena_allele, pure_alt, pure_n)){
+                    status = "PASS";
+                }
+                else {
+                    status = "BP_FAIL";
+                }
+            }
+
+            mitonuclear_ld(samples, ploidy, alt_copies, ena_allele, ld);
+            write_ld_site(ld_fh, chrom, pos, gene, region, ref, alt, clsfion, status, ena_allele,
+                          pure_alt, pure_n, ld);
+            ld_sites++;
+        }
 
         // can we rescue this site?
         if (ena_allele != -1 && shares_homozygotes(samples, ploidy, alt_copies)){
@@ -1761,6 +2174,10 @@ parse_vcf(const string &vcf, const double min_freq, const double min_frac, const
     close_in_filestream(gzipped, gz_fh, txt_fh);
     ofh.close();
 
+    if (write_ld){
+        ld_fh.close();
+    }
+
     if (!genome.empty()){
         cerr << "Total exonic sites scanned "   << exonic_sites   << '\n'
              << "Total promoter sites scanned " << promoter_sites << '\n';
@@ -1774,12 +2191,16 @@ parse_vcf(const string &vcf, const double min_freq, const double min_frac, const
          << "  of which fixed differences with heterozygous bear paw (BP_HET_DIFF) " << het_diff << '\n'
          << "Sites rescued (pure populations fixed, bear paw heterozygous) " << rescued << '\n';
 
+    if (write_ld){
+        cerr << "Sites written to the mitonuclear LD file " << ld_sites << '\n';
+    }
+
     return 0;
 }
 
 void
 help(){
-    cerr << "Usage: ./find_bear_paw_hetero_sites -v vcf_file -p popmap.tsv -m <float> -f <float> -x <float> -u <int> -a ann.gtf [optional] -g gene_list.txt [optional]\n"
+    cerr << "Usage: ./find_bear_paw_hetero_sites -v vcf_file -p popmap.tsv -m <float> -f <float> -x <float> -u <int> -a ann.gtf [optional] -g gene_list.txt [optional] -l [optional]\n"
          << "\t-v: vcf file containing the bear paw samples along with the other TNP and ENA stickleback population [required]\n"
          << "\t-p: A population map containing 3 columns: [Sample][Population][Sex] [required]\n"
          << "\t-m: Minimum frequency of an allele in a population (0.5 < x <= 1), to consider it differentiated [default: 1.0]\n"
@@ -1787,7 +2208,8 @@ help(){
          << "\t-x: Maximum fraction of missing samples allowed in each group [default: 1.0; no filter]\n"
          << "\t-a: The genome annotation file to overlap SNPs with\n"
          << "\t-g: A file contain the gene_ids (one per line) of interest. Only these genes will be investigated in the annotation\n"
-         << "\t-u: Number of sites to look upstream of a gene when using a genome annotation [default: 0]\n";
+         << "\t-u: Number of sites to look upstream of a gene when using a genome annotation [default: 0]\n"
+         << "\t-l: Also write Bear_Paw_mitonuclear_ld.tsv: LD between the nuclear ENA allele and the ENA mitotype within Bear Paw for every informative (DIFF/PRIVATE) nuclear site, with a permutation p-value [default: off]\n";
     exit(1);
 }
 
@@ -1795,7 +2217,8 @@ int main(int argc, char *argv[]){
 
     string vcf, ann, pop_file, arg, genes_list;
     double min_freq = 1.0, min_frac = 1.0, max_missing = 1.0;
-    int upstream = 0;
+    int  upstream = 0;
+    bool write_ld = false;
 
     // expect at least a single argument
     if (argc < 2){
@@ -1815,6 +2238,9 @@ int main(int argc, char *argv[]){
         }
         else if (arg == "-g" && i + 1 < argc){
             genes_list = argv[i + 1];
+        }
+        else if (arg == "-l"){
+            write_ld = true;
         }
         else if (arg == "-h"){
             help();
@@ -1928,7 +2354,7 @@ int main(int argc, char *argv[]){
     parse_popmap(pop_file, pop_map, pops);
     
     // parse the vcf file
-    parse_vcf(vcf, min_freq, min_frac, max_missing, pops, pop_map, genome);
+    parse_vcf(vcf, min_freq, min_frac, max_missing, write_ld, pops, pop_map, genome);
 
     // we are done
     clean_up(genome, pop_map);
