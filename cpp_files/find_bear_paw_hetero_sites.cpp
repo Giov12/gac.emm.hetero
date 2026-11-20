@@ -1644,7 +1644,13 @@ write_ld_header(ofstream &fh, const vector<string> &pops){
        << "BP_"   << pops[0]     << "_nalleles\tBP_" << pops[1] << "_nalleles\t"
        << "BP_"   << pops[0]     << "_q" << pops[0]  << "\tBP_" << pops[1] 
        << "_q"    << pops[0]     
-       << "\tpB\tD\tD_prime\tr2\tn_perm\tperm_type\tp_perm\tBP_ndiploid\tBP_Ho\tBP_He\tBP_Fis\n";
+       << "\tpB\tD\tD_prime\tr2\tn_perm\tperm_type\tp_perm\tBP_ndiploid\tBP_Ho\tBP_He\tBP_Fis";
+
+    // for genotype summaries
+    fh << '\t' << pops[0] << "_genotypes"
+       << '\t' << "BP_"   << pops[0]      << "_genotypes"
+       << '\t' << "BP_"   << pops[1]      << "_genotypes"
+       << '\t' << pops[1] << "_genotypes" << '\n';
 
 }
 
@@ -1816,7 +1822,8 @@ void
 write_ld_site(ofstream &fh, const string &chrom, const uint pos, const Gene *gene,
               const RegionType region, const string &ref, const string &alt,
               const Classification c, const string &status, const int ena_allele,
-              const uint pure_alt[2], const uint pure_n[2], const MitoLD &ld){
+              const uint pure_alt[2], const uint pure_n[2], const MitoLD &ld,
+              const vector<Sample*> &samples, const vector<uint> &ploidy, const vector<int> &alt_copies){
     //
     // write one site to the mitonuclear LD output
     //
@@ -1878,7 +1885,13 @@ write_ld_site(ofstream &fh, const string &chrom, const uint pos, const Gene *gen
     write_value(fh, ld.n_dip > 0, ld.ho);
     write_value(fh, ld.n_dip > 0, ld.he);
     write_value(fh, ld.fis_valid, ld.fis);
-    fh << '\n';
+
+    // genotype summaries: ENA, BP ENA, BP TNP, TNP
+    fh << '\t' << genotype_summary(samples, ploidy, alt_copies, ref, alt, mtType::ENA, false)
+       << '\t' << genotype_summary(samples, ploidy, alt_copies, ref, alt, mtType::ENA, true)
+       << '\t' << genotype_summary(samples, ploidy, alt_copies, ref, alt, mtType::TNP, true)
+       << '\t' << genotype_summary(samples, ploidy, alt_copies, ref, alt, mtType::TNP, false)
+       << '\n';
 }
 
 
@@ -2102,7 +2115,7 @@ parse_vcf(const string &vcf, const double min_freq, const double min_frac, const
 
             mitonuclear_ld(samples, ploidy, alt_copies, ena_allele, ld);
             write_ld_site(ld_fh, chrom, pos, gene, region, ref, alt, clsfion, status, ena_allele,
-                          pure_alt, pure_n, ld);
+                          pure_alt, pure_n, ld, samples, ploidy, alt_copies);
             ld_sites++;
         }
 
