@@ -142,8 +142,10 @@ struct Counter {
     uint exonic       = 0;
     uint promoter     = 0;
     uint ref_mismatch = 0;
-    uint no_alleles   = 0; // only spanning deletions (*) in the locus
+    uint no_alleles   = 0; // only spanning deletions (*) or symbolic alleles in the locus
     uint conflicts    = 0; // sample calls that could not be combined
+    uint symbolic     = 0; // sample calls carrying a symbolic allele (e.g. <DEL>)
+    uint unphased     = 0; // sample calls with more than one way to build the haplotypes
     uint low_gq       = 0; // sample calls removed by -q
     uint low_ab       = 0; // sample het calls removed by -b
     uint too_missing  = 0;
@@ -1087,6 +1089,158 @@ get_subfield(const string &field, const int idx){
     return "";
 }
 
+string
+build_haplotype(const string &ref_seq, vector<int> alleles, const vector<uint> &var_offset,
+                const vector<uint> &var_reflen, const vector<string> &var_alt){
+    //
+    // apply the (non overlapping) record alleles to the
+    // reference sequence of the locus, left to right
+    //
+
+    sort(alleles.begin(), alleles.end(), [&var_offset]
+        (const int a, const int b){
+            return var_offset[a] < var_offset[b];
+        }
+    );
+
+    string seq;
+    uint prev = 0; // next reference base not yet copied
+
+    for (uint i = 0; i < alleles.size(); i++){
+        const int a = alleles[i];
+        seq += ref_seq.substr(prev, var_offset[a] - prev);
+        seq += var_alt[a];
+        prev = var_offset[a] + var_reflen[a];
+    }
+    seq += ref_seq.substr(prev);
+
+    return seq;
+}
+
+int
+phase_find(vector<int> &parent, vector<int> &parity, const int x){
+
+    //
+    // union find the parent of this haplotype
+    // to the parity of x relative to that root
+    //
+
+    // parent to itself
+    if (parent[x] == x){
+        return x;
+    }
+
+    int p    = parent[x];
+    int root = phase_find(parent, parity, p);
+    parity[x] ^= parity[p]; // parity[p] is now relative to the root
+    parent[x] = root;
+
+    return root;
+}
+
+bool
+phase_union(vector<int> &parent, vector<int> &parity, const int a, const int b, const int rel){
+    //
+    // record that value(a) XOR value(b) == rel
+    // return false if that contradicts what is already known
+    //
+
+    int ra = phase_find(parent, parity, a);
+    int rb = phase_find(parent, parity, b);
+
+    if (ra == rb){
+        return (parity[a] ^ parity[b]) == rel;
+    }
+
+    parent[ra] = rb;
+    parity[ra] = parity[a] ^ parity[b] ^ rel;
+
+    return true;
+}
+
+void
+record_phase(const string &field, const string &gt_str, const vector<int> &gt,
+             const vector<int> &rec_allele_idx, const vector<int> &rec_copies,
+             const int ps_idx, const int pgt_idx, const int pid_idx,
+             vector<string> &phase_set, vector<int> &phase_side){
+
+    //
+    // collect GATK's phasing for the alleles this sample
+    // carries once in this record
+    //
+    //  1. a phased GT (0|1) with a PS value
+    //  2. otherwise a phased PGT with a PID
+    //     it splits a record, so a split PGT can be stale)
+    //
+    // phase_set[k] = which phase set allele k belongs to
+    // phase_side[k] = which side of the phased call it is on (0 or 1)
+    //
+
+    if (gt.size() != 2){
+        return; // only diploid calls are phased
+    }
+
+    string set_id;
+    vector<int> pg;
+
+    string ps = get_subfield(field, ps_idx);
+    if (gt_str.find('|') != string::npos && !ps.empty() && ps != "."){
+        set_id = "PS:" + ps;
+        pg     = gt;
+    }
+    else {
+        string pgt = get_subfield(field, pgt_idx);
+        string pid = get_subfield(field, pid_idx);
+
+        if (pgt.find('|') == string::npos || pid.empty() || pid == "."){
+            return; // no phasing for this call
+        }
+        if (!parse_gt(pgt, pg) || pg.size() != 2){
+            return;
+        }
+
+        // PGT must hold the same alleles as GT
+        vector<int> a = gt, b = pg;
+        sort(a.begin(), a.end());
+        sort(b.begin(), b.end());
+        if (a != b){
+            return;
+        }
+        set_id = "PID:" + pid;
+    }
+
+    for (uint j = 0; j < 2; j++){
+        if (pg[j] < 0 || pg[j] >= (int)rec_allele_idx.size()){
+            continue;
+        }
+        int k = rec_allele_idx[pg[j]];
+        if (k <= 0 || rec_copies[k] != 1){
+            continue; // reference, *, symbolic or a homozygous allele
+        }
+        if (phase_set[k].empty()){
+            phase_set[k]  = set_id;
+            phase_side[k] = j;
+        }
+    }
+}
+
+bool
+variants_overlap(const int k1, const int k2, const vector<uint> &var_offset,
+                 const vector<uint> &var_reflen){
+    //
+    // helper function to determine if the two records span 
+    // a shared position in the ref
+    //
+
+    uint s1 = var_offset[k1];
+    uint s2 = var_offset[k2];
+    uint e1 = s1 + var_reflen[k1] - 1;
+    uint e2 = s2 + var_reflen[k2] - 1;
+
+    return s1 <= e2 && s2 <= e1;
+}
+
+
 bool
 build_locus(const vector<Record> &records, const string &chrom, const vector<Sample*> &samples,
             const Params &params, Locus &locus, Counter &counts){
@@ -1095,20 +1249,17 @@ build_locus(const vector<Record> &records, const string &chrom, const vector<Sam
     // collapse the overlapping records into one locus
     //
     //  1. rebuild the reference sequence across the locus from the REF
-    //     fields (they overlap, so they cover the locus without gaps)
-    //  2. turn every alt into the sequence it creates across the locus,
-    //     identical sequences are the same allele
-    //  3. combine each sample's calls across the records into one genotype
-    //
+    //     fields
+    //  2. turn every alt into the sequence it creates across the locus
+    //  3. combine each sample's calls across the records into two
+    //     haplotypes & then into one genotype
     // returns false if the locus can't be built
     //
 
-    locus.chrom    = chrom;
-    locus.start    = records[0].pos;
-    locus.end      = records[0].end;
-    locus.nrecords = records.size();
-
-    // this will be used repetively
+    locus.chrom     = chrom;
+    locus.start     = records[0].pos;
+    locus.end       = records[0].end;
+    locus.nrecords  = records.size();
     const uint nrec = records.size();
 
     for (uint r = 1; r < nrec; r++){
@@ -1128,18 +1279,12 @@ build_locus(const vector<Record> &records, const string &chrom, const vector<Sam
 
         for (uint j = 0; j < rec.ref.size(); j++){
             char base = toupper(rec.ref[j]);
-
-            //
-            // the nucleotide was been filled, so we can't be 100% sure
-            // even a single bp is considered an indel
-            //
             if (filled[offset + j] && ref_seq[offset + j] != base){
                 cerr << "Warning: REF bases disagree at " << chrom << ':' << rec.pos
                      << ", skipping this locus\n";
                 counts.ref_mismatch++;
                 return false;
             }
-            
             ref_seq[offset + j] = base;
             filled[offset + j]  = true;
         }
@@ -1149,12 +1294,17 @@ build_locus(const vector<Record> &records, const string &chrom, const vector<Sam
     // 2. alleles as sequences across the locus
     // allele_idx[r][g] = locus allele for GT index g of record r
     // -2 = spanning deletion (*), the copy is described by another record
+    // -3 = symbolic allele (e.g. <DEL>), no sequence to compare
     //
     locus.alleles.clear();
     locus.alleles.push_back(ref_seq);
 
-    unordered_map<string,int> seq_to_idx;
-    seq_to_idx[ref_seq] = 0; // map of allele to index
+    unordered_map<string, int> seq_to_idx;
+    seq_to_idx[ref_seq] = 0;
+
+    vector<uint>   var_offset(1, 0);
+    vector<uint>   var_reflen(1, 0);
+    vector<string> var_alt(1, "");
 
     vector<vector<int>> allele_idx(nrec);
 
@@ -1166,8 +1316,12 @@ build_locus(const vector<Record> &records, const string &chrom, const vector<Sam
 
         for (uint j = 0; j < rec.alts.size(); j++){
             const string &alt = rec.alts[j];
-            if (alt == "*" || alt == "."){ // missing
+            if (alt == "*" || alt == "."){ // missing because a possible deletion
                 allele_idx[r].push_back(-2);
+                continue;
+            }
+            if (alt[0] == '<'){ // deletion coming up (based on vcf specifications)
+                allele_idx[r].push_back(-3);
                 continue;
             }
 
@@ -1181,35 +1335,43 @@ build_locus(const vector<Record> &records, const string &chrom, const vector<Sam
             if (seq_to_idx.count(seq) == 0){
                 seq_to_idx[seq] = locus.alleles.size();
                 locus.alleles.push_back(seq);
+                var_offset.push_back(offset);
+                var_reflen.push_back(rec.ref.size());
+                var_alt.push_back(upper_alt);
             }
             allele_idx[r].push_back(seq_to_idx[seq]);
         }
     }
 
-    // ref will occupy 1 space
     if (locus.alleles.size() < 2){
         counts.no_alleles++;
-        return false; // nothing but spanning deletions
+        return false; // nothing but spanning deletions or symbolic alleles
     }
 
+    // record alleles. combined haplotypes are added after these
+    const uint nvar = locus.alleles.size();
+
     //
-    // where are GT, AD, DP & GQ in each record
+    // where are GT, AD, DP, GQ & the phasing fields in each record
     //
     vector<int> gt_idx(nrec), ad_idx(nrec), dp_idx(nrec), gq_idx(nrec);
+    vector<int> ps_idx(nrec), pgt_idx(nrec), pid_idx(nrec);
 
     for (uint r = 0; r < nrec; r++){
         const string &format = records[r].parts[8];
-        gt_idx[r] = find_format_index(format, "GT");
-        ad_idx[r] = find_format_index(format, "AD");
-        dp_idx[r] = find_format_index(format, "DP");
-        gq_idx[r] = find_format_index(format, "GQ");
+        gt_idx[r]  = find_format_index(format, "GT");
+        ad_idx[r]  = find_format_index(format, "AD");
+        dp_idx[r]  = find_format_index(format, "DP");
+        gq_idx[r]  = find_format_index(format, "GQ");
+        ps_idx[r]  = find_format_index(format, "PS");
+        pgt_idx[r] = find_format_index(format, "PGT");
+        pid_idx[r] = find_format_index(format, "PID");
     }
 
     //
     // 3. one genotype per sample
     //
     const uint nsamples = samples.size();
-    const uint nalleles = locus.alleles.size();
 
     locus.ploidy.assign(nsamples, 0);
     locus.a1.assign(nsamples, -1);
@@ -1218,7 +1380,9 @@ build_locus(const vector<Record> &records, const string &chrom, const vector<Sam
 
     vector<int>    gt;
     vector<string> ad_parts;
-    vector<int>    copies(nalleles), rec_copies(nalleles), depth(nalleles);
+    vector<int>    copies(nvar), rec_copies(nvar), depth(nvar);
+    vector<string> phase_set(nvar);
+    vector<int>    phase_side(nvar);
 
     for (uint i = 0; i < nsamples; i++){
         Sample *sample = samples[i];
@@ -1232,16 +1396,19 @@ build_locus(const vector<Record> &records, const string &chrom, const vector<Sam
             continue; // no call expected (females on the Y)
         }
 
-        copies.assign(nalleles, 0);
-        depth.assign(nalleles, 0);
+        copies.assign(nvar, 0);
+        depth.assign(nvar, 0);
+        phase_set.assign(nvar, "");
+        phase_side.assign(nvar, -1);
         bool missing    = false;
         bool ref_depth  = false; // has the reference depth been set
         int  first_ad   = -1;    // reference depth of the first record with depths
 
         for (uint r = 0; r < nrec && !missing; r++){
             const string &field = records[r].parts[i + 9];
+            string gt_str       = get_subfield(field, gt_idx[r]);
 
-            if (!parse_gt(get_subfield(field, gt_idx[r]), gt)){
+            if (!parse_gt(gt_str, gt)){
                 missing = true;
                 break;
             }
@@ -1253,7 +1420,6 @@ build_locus(const vector<Record> &records, const string &chrom, const vector<Sam
                 break;
             }
 
-            // does this pass the genotype quality scoring
             if (params.min_gq > 0){
                 int gq = to_int(get_subfield(field, gq_idx[r]));
                 if (gq >= 0 && gq < params.min_gq){
@@ -1277,11 +1443,11 @@ build_locus(const vector<Record> &records, const string &chrom, const vector<Sam
             }
 
             //
-            // copies of each locus allele in this record. a record
+            // copies of each record allele in this record. a record
             // that repeats an allele from another record (same sequence)
             // should not count it twice, so keep the max across records
             //
-            rec_copies.assign(nalleles, 0);
+            rec_copies.assign(nvar, 0);
             bool carries_alt = false;
 
             for (uint j = 0; j < gt.size(); j++){
@@ -1290,6 +1456,11 @@ build_locus(const vector<Record> &records, const string &chrom, const vector<Sam
                     break;
                 }
                 int k = allele_idx[r][gt[j]];
+                if (k == -3){
+                    counts.symbolic++;
+                    missing = true; // can't place a symbolic allele
+                    break;
+                }
                 if (k <= 0){
                     continue; // reference or spanning deletion
                 }
@@ -1300,10 +1471,16 @@ build_locus(const vector<Record> &records, const string &chrom, const vector<Sam
                 break;
             }
 
-            for (uint k = 1; k < nalleles; k++){
+            for (uint k = 1; k < nvar; k++){
                 if (rec_copies[k] > copies[k]){
                     copies[k] = rec_copies[k];
                 }
+            }
+
+            // physical phasing of the alleles carried once
+            if (carries_alt){
+                record_phase(field, gt_str, gt, allele_idx[r], rec_copies,
+                             ps_idx[r], pgt_idx[r], pid_idx[r], phase_set, phase_side);
             }
 
             //
@@ -1312,20 +1489,15 @@ build_locus(const vector<Record> &records, const string &chrom, const vector<Sam
             // carries an alt, or the first record if it never does
             //
             parse_string(get_subfield(field, ad_idx[r]), ',', ad_parts);
-
             if (ad_parts.size() == allele_idx[r].size()){
                 int ref_ad = to_int(ad_parts[0]);
-
-                // likely missing, so default to ref
                 if (first_ad == -1){
                     first_ad = ref_ad;
-                
                 }
                 if (carries_alt && !ref_depth && ref_ad >= 0){
                     depth[0]  = ref_ad;
                     ref_depth = true;
                 }
-
                 for (uint g = 1; g < ad_parts.size(); g++){
                     int k  = allele_idx[r][g];
                     int ad = to_int(ad_parts[g]);
@@ -1344,39 +1516,194 @@ build_locus(const vector<Record> &records, const string &chrom, const vector<Sam
             depth[0] = first_ad;
         }
 
-        // how many non reference copies across the locus
-        int total = 0;
-        for (uint k = 1; k < nalleles; k++){
-            total += copies[k];
+        //
+        // every alt copy the sample carries. a homozygous allele
+        // gives two copies, which overlap each other, so they are
+        // forced onto different haplotypes
+        //
+        vector<int> copy_k;
+        for (uint k = 1; k < nvar; k++){
+            for (int c = 0; c < copies[k]; c++){
+                copy_k.push_back(k);
+            }
+        }
+        const uint ncopy = copy_k.size();
+
+        // hap[u] = which haplotype (0 or 1) copy u sits on
+        vector<int> hap(ncopy, 0);
+        bool bad      = false; // the calls can't be combined
+        bool unphased = false; // more than one way to combine them
+
+        if (ploidy == 1){
+            // one haplotype, so nothing may overlap
+            for (uint u = 0; u < ncopy && !bad; u++){
+                for (uint t = u + 1; t < ncopy; t++){
+                    if (variants_overlap(copy_k[u], copy_k[t], var_offset, var_reflen)){
+                        bad = true;
+                        break;
+                    }
+                }
+            }
+        }
+        else {
+            //
+            // label the copies (haplotypes) so that
+            // overlapping copies get different labeles. each connected
+            // group of overlapping copies (a component) can be labeled
+            // 2 ways, so the groups still have to be lined up
+            //
+            vector<int> label(ncopy, -1), comp(ncopy, -1);
+            uint ncomp = 0;
+
+            for (uint s = 0; s < ncopy && !bad; s++){
+                if (label[s] != -1){
+                    continue;
+                }
+                vector<uint> queue(1, s);
+                label[s] = 0;
+                comp[s]  = ncomp;
+
+                for (uint q = 0; q < queue.size() && !bad; q++){
+                    uint u = queue[q];
+                    for (uint t = 0; t < ncopy; t++){
+                        if (t == u || !variants_overlap(copy_k[u], copy_k[t], var_offset, var_reflen)){
+                            continue;
+                        }
+                        if (label[t] == -1){
+                            label[t] = 1 - label[u];
+                            comp[t]  = ncomp;
+                            queue.push_back(t);
+                        }
+                        else if (label[t] == label[u]){
+                            bad = true; // e.g. three copies that all overlap
+                            break;
+                        }
+                    }
+                }
+                ncomp++;
+            }
+
+            //
+            // line the components up with GATK's phasing. nodes 0..ncomp-1
+            // are the components, the rest are the phase sets. each phased
+            // copy says: flip(component) XOR flip(set) = label XOR side
+            //
+            // this also runs for a single component, so phasing that puts
+            // two overlapping variants on the same haplotype is caught
+            //
+            vector<int> flip(ncomp, 0);
+
+            if (!bad && ncomp > 0){
+                unordered_map<string, int> set_node;
+                vector<int> parent, parity;
+                for (uint c = 0; c < ncomp; c++){
+                    parent.push_back(c);
+                    parity.push_back(0);
+                }
+
+                for (uint u = 0; u < ncopy && !bad; u++){
+                    const int k = copy_k[u];
+                    if (phase_set[k].empty()){
+                        continue; // not phased
+                    }
+                    if (set_node.count(phase_set[k]) == 0){
+                        set_node[phase_set[k]] = parent.size();
+                        parent.push_back(parent.size());
+                        parity.push_back(0);
+                    }
+                    int rel = label[u] ^ phase_side[k];
+                    if (!phase_union(parent, parity, comp[u], set_node[phase_set[k]], rel)){
+                        bad = true; // the phasing contradicts itself
+                    }
+                }
+
+                if (!bad){
+                    int root = phase_find(parent, parity, 0);
+                    for (uint c = 1; c < ncomp; c++){
+                        if (phase_find(parent, parity, c) != root){
+                            unphased = true; // these groups can't be lined up
+                            break;
+                        }
+                    }
+                    for (uint c = 0; c < ncomp && !unphased; c++){
+                        phase_find(parent, parity, c);
+                        flip[c] = parity[c];
+                    }
+                }
+            }
+
+            if (!bad){
+                for (uint u = 0; u < ncopy; u++){
+                    hap[u] = label[u] ^ flip[comp[u]];
+                }
+            }
         }
 
-        if (total > ploidy){
+        if (bad){
             counts.conflicts++; // e.g. 0/1 in three overlapping records
             continue;
         }
+        if (unphased){
+            counts.unphased++;
+            continue;
+        }
 
-        // build the genotype, reference copies fill the rest
-        vector<int> geno;
-        for (uint k = 1; k < nalleles; k++){
-            for (int c = 0; c < copies[k]; c++){
-                geno.push_back(k);
+        //
+        // build each haplotype's sequence & turn it into an allele.
+        // a haplotype carrying several variants is a new allele
+        //
+        int    geno[2]      = {0, 0};
+        int    hap_depth[2] = {depth[0], depth[0]};
+        string seq;
+
+        for (int h = 0; h < ploidy; h++){
+            vector<int> ks;
+            for (uint u = 0; u < ncopy; u++){
+                if (hap[u] == h){
+                    ks.push_back(copy_k[u]);
+                }
+            }
+
+            if (ks.empty()){
+                geno[h] = 0; // reference haplotype
+                continue;
+            }
+
+            seq = build_haplotype(ref_seq, ks, var_offset, var_reflen, var_alt);
+            if (seq_to_idx.count(seq) == 0){
+                seq_to_idx[seq] = locus.alleles.size();
+                locus.alleles.push_back(seq);
+            }
+            geno[h] = seq_to_idx[seq];
+
+            // reads for a haplotype: the weakest of its variants
+            hap_depth[h] = depth[ks[0]];
+            for (uint v = 1; v < ks.size(); v++){
+                if (depth[ks[v]] < hap_depth[h]){
+                    hap_depth[h] = depth[ks[v]];
+                }
             }
         }
-        while ((int)geno.size() < ploidy){
-            geno.push_back(0);
-        }
-        sort(geno.begin(), geno.end());
 
         if (ploidy == 1){
             locus.a1[i] = geno[0];
             continue;
         }
 
+        if (geno[0] > geno[1]){
+            int tmp = geno[0];
+            geno[0] = geno[1];
+            geno[1] = tmp;
+            tmp          = hap_depth[0];
+            hap_depth[0] = hap_depth[1];
+            hap_depth[1] = tmp;
+        }
+
         // het calls get an allele balance (minor allele fraction)
         double ab = -1;
         if (geno[0] != geno[1]){
-            int d1 = depth[geno[0]];
-            int d2 = depth[geno[1]];
+            int d1 = hap_depth[0];
+            int d2 = hap_depth[1];
             if (d1 + d2 > 0){
                 if (d1 < d2){
                     ab = (double)d1 / (d1 + d2);
@@ -2123,8 +2450,10 @@ parse_vcf(const string &vcf, const Params &params, const vector<string> &pops,
     }
 
     cerr << "Loci skipped for disagreeing REF bases " << counts.ref_mismatch << '\n'
-         << "Loci skipped with only spanning deletions (*) " << counts.no_alleles << '\n'
-         << "Sample calls set to missing (records could not be combined) " << counts.conflicts << '\n';
+         << "Loci skipped with only spanning deletions (*) or symbolic alleles " << counts.no_alleles << '\n'
+         << "Sample calls set to missing (records could not be combined) " << counts.conflicts << '\n'
+         << "Sample calls set to missing (symbolic allele, e.g. <DEL>) " << counts.symbolic << '\n'
+         << "Sample calls set to missing (haplotypes could not be phased) " << counts.unphased << '\n';
 
     if (params.min_gq > 0){
         cerr << "Sample calls set to missing for GQ below " << params.min_gq << ' ' << counts.low_gq << '\n';
