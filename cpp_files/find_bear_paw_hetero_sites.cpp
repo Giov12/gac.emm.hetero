@@ -109,7 +109,8 @@ enum mtType {
 enum RegionType {
     NoRegion = 0,
     Exonic   = 1,
-    Promoter = 2
+    Promoter = 2,
+    Intronic = 3 // within N basepairs (e.g., splice sites)
 };
 
 enum Classification {
@@ -241,6 +242,32 @@ public:
             }
         }
         // no overlap
+        return false;
+    }
+
+    bool near_exon(uint pos, uint flank){
+
+        //
+        // is this intronic site within flank bp of an exon edge
+        //
+
+        if (this->exons.size() == 1){
+            return false; // no introns
+        }
+
+        for (uint i = 0; i < this->exons.size(); i++){
+            const Exon &e = this->exons[i];
+            uint dist;
+            if (pos < e.start){
+                dist = e.start - pos; // intron before this exon (acceptor side on + strand)
+            }
+            else {
+                dist = pos - e.end;   // intron after this exon (donor side on + strand)
+            }
+            if (dist <= flank){
+                return true;
+            }
+        }
         return false;
     }
 
@@ -776,7 +803,8 @@ clean_up(unordered_map<string, vector<Gene*>> &genome, unordered_map<string, Sam
 }
 
 Gene *
-is_candidate_region(const uint pos, vector<Gene*>*genes, vector<uint> &gene_ends, RegionType &region){
+is_candidate_region(const uint pos, vector<Gene*>*genes, vector<uint> &gene_ends, 
+                    const uint intron_flank, RegionType &region){
 
     //
     // helper function to determine
@@ -807,6 +835,7 @@ is_candidate_region(const uint pos, vector<Gene*>*genes, vector<uint> &gene_ends
 
     Gene *gene;
     Gene *promoter_hit = nullptr;
+    Gene *intron_hit   = nullptr;
 
     while (left < ngenes){
         gene = (*genes)[left];
@@ -815,9 +844,14 @@ is_candidate_region(const uint pos, vector<Gene*>*genes, vector<uint> &gene_ends
             break; // this & all later genes begin after pos
         }
         if (pos <= gene->search_end){
-            if (gene->start <= pos && pos <= gene->end && gene->is_exonic(pos)){
-                region = RegionType::Exonic;
-                return gene; // lands in an exon
+            if (gene->start <= pos && pos <= gene->end){
+                if (gene->is_exonic(pos)){
+                    region = RegionType::Exonic;
+                    return gene; // lands in an exon
+                }
+                if (intron_hit == nullptr && intron_flank > 0 && gene->near_exon(pos, intron_flank)){
+                    intron_hit = gene; // possible splice site, keep looking for an exon
+                }
             }
             else if (promoter_hit == nullptr && gene->in_promoter(pos)){
                 promoter_hit = gene; // keep looking for an exon
@@ -828,6 +862,11 @@ is_candidate_region(const uint pos, vector<Gene*>*genes, vector<uint> &gene_ends
 
     if (promoter_hit != nullptr){
         region = RegionType::Promoter;
+        return promoter_hit;
+    }
+    else if (intron_hit != nullptr){
+        region = RegionType::Intronic;
+        return intron_hit;
     }
 
     return promoter_hit; // this may never change from nullptr
@@ -1793,6 +1832,9 @@ write_site(ofstream &fh, const string &chrom, const uint pos, const Gene *gene,
         case RegionType::Promoter:
             r_label = "promoter";
             break;
+        case RegionType::Intronic:
+            r_label = "intron";
+            break;
         default:
             r_label = ".";
             break;
@@ -1854,6 +1896,9 @@ write_ld_site(ofstream &fh, const string &chrom, const uint pos, const Gene *gen
     else if (region == RegionType::Promoter){
         r_label = "promoter";
     }
+    else if (region == RegionType::Intronic){
+        r_label = "intron";
+    }
 
     fh << chrom    << '\t' << pos      << '\t' << gene_id << '\t' << r_label << '\t'
        << ref      << '\t' << alt      << '\t' << c_label << '\t' << status  << '\t'
@@ -1897,7 +1942,7 @@ write_ld_site(ofstream &fh, const string &chrom, const uint pos, const Gene *gen
 
 int
 parse_vcf(const string &vcf, const double min_freq, const double min_frac, const double max_missing, const bool write_ld,
-          const vector<string> &pops, unordered_map<string, Sample*> &pop_map, unordered_map<string, vector<Gene*>> &genome){
+          const uint intron_flank, const vector<string> &pops, unordered_map<string, Sample*> &pop_map, unordered_map<string, vector<Gene*>> &genome){
 
     //
     // this function will be the main work horse for this
@@ -1957,7 +2002,7 @@ parse_vcf(const string &vcf, const double min_freq, const double min_frac, const
     bool   keep_reading;
     int    gt_idx, ena_allele;
     uint snp_sites = 0, informative = 0, shared_hom = 0, rescued = 0, het_diff = 0;
-    uint passed = 0, miss_cnt = 0, exonic_sites = 0, promoter_sites = 0;
+    uint passed = 0, miss_cnt = 0, exonic_sites = 0, promoter_sites = 0, intronic_sites = 0;
     uint pure_alt[2], pure_n[2]; // per site tallies for "pure" populations
     uint bp[2][4];               // per site bear paw genotype counts
     Gene *gene;
@@ -2054,7 +2099,7 @@ parse_vcf(const string &vcf, const double min_freq, const double min_frac, const
             }
             
             // check if this position is exonic
-            gene = is_candidate_region(pos, genes, gene_ends, region);
+            gene = is_candidate_region(pos, genes, gene_ends, intron_flank, region);
             if (gene == nullptr){
                 continue;
             }
@@ -2063,6 +2108,9 @@ parse_vcf(const string &vcf, const double min_freq, const double min_frac, const
             }
             else if (region == RegionType::Promoter){
                 promoter_sites++;
+            }
+            else if (region == RegionType::Intronic){
+                intronic_sites++;
             }
         }
         
@@ -2194,6 +2242,9 @@ parse_vcf(const string &vcf, const double min_freq, const double min_frac, const
     if (!genome.empty()){
         cerr << "Total exonic sites scanned "   << exonic_sites   << '\n'
              << "Total promoter sites scanned " << promoter_sites << '\n';
+        if (intron_flank > 0){
+            cerr << "Total intronic sites scanned (within " << intron_flank << " bp of an exon) " << intronic_sites << '\n';
+        }
     }
 
     cerr << "Biallelic SNPs scanned "    << snp_sites << '\n'
@@ -2213,7 +2264,7 @@ parse_vcf(const string &vcf, const double min_freq, const double min_frac, const
 
 void
 help(){
-    cerr << "Usage: ./find_bear_paw_hetero_sites -v vcf_file -p popmap.tsv -m <float> -f <float> -x <float> -u <int> -a ann.gtf [optional] -g gene_list.txt [optional] -l [optional]\n"
+    cerr << "Usage: ./find_bear_paw_hetero_sites -v vcf_file -p popmap.tsv -m <float> -f <float> -x <float> -u <int> -i <int> -a ann.gtf [optional] -g gene_list.txt [optional] -l [optional]\n"
          << "\t-v: vcf file containing the bear paw samples along with the other TNP and ENA stickleback population [required]\n"
          << "\t-p: A population map containing 3 columns: [Sample][Population][Sex] [required]\n"
          << "\t-m: Minimum frequency of an allele in a population (0.5 < x <= 1), to consider it differentiated [default: 1.0]\n"
@@ -2222,6 +2273,7 @@ help(){
          << "\t-a: The genome annotation file to overlap SNPs with\n"
          << "\t-g: A file contain the gene_ids (one per line) of interest. Only these genes will be investigated in the annotation\n"
          << "\t-u: Number of sites to look upstream of a gene when using a genome annotation [default: 0]\n"
+         << "\t-i: Also include intronic sites within this many bp of an exon [default: 0]\n"
          << "\t-l: Also write Bear_Paw_mitonuclear_ld.tsv: LD between the nuclear ENA allele and the ENA mitotype within Bear Paw for every informative (DIFF/PRIVATE) nuclear site, with a permutation p-value [default: off]\n";
     exit(1);
 }
@@ -2230,7 +2282,7 @@ int main(int argc, char *argv[]){
 
     string vcf, ann, pop_file, arg, genes_list;
     double min_freq = 1.0, min_frac = 1.0, max_missing = 1.0;
-    int  upstream = 0;
+    int  upstream = 0, intron_flank = 0;
     bool write_ld = false;
 
     // expect at least a single argument
@@ -2283,6 +2335,20 @@ int main(int argc, char *argv[]){
             }
             catch (const std::invalid_argument &e){
                 cerr << "Error: -f must be a float. Encountered " << argv[i + 1] << '\n';
+                exit(EXIT_FAILURE);
+            }
+        }
+        else if (arg == "-i" && i + 1 < argc){
+            try {
+                intron_flank = stoi(argv[i + 1]);
+
+                if (intron_flank < 0){
+                    cerr << "Error: -i must be 0 or a positive number of bp\n";
+                    exit(EXIT_FAILURE);
+                }
+            }
+            catch (const std::invalid_argument &e){
+                cerr << "Error: -i must be an integer. Encountered " << argv[i + 1] << '\n';
                 exit(EXIT_FAILURE);
             }
         }
@@ -2367,7 +2433,7 @@ int main(int argc, char *argv[]){
     parse_popmap(pop_file, pop_map, pops);
     
     // parse the vcf file
-    parse_vcf(vcf, min_freq, min_frac, max_missing, write_ld, pops, pop_map, genome);
+    parse_vcf(vcf, min_freq, min_frac, max_missing, write_ld, intron_flank, pops, pop_map, genome);
 
     // we are done
     clean_up(genome, pop_map);
