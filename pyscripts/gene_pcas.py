@@ -19,6 +19,7 @@ targets = set()
 genes   = defaultdict(list) # chrom -> [Gene class]
 samples = dict()            # sample  -> Sample
 annPCA  = False             # annotate the PCA plot with the sample's id
+convert_to_diploid = False  
 
 class Sample:
 
@@ -89,7 +90,7 @@ class Gene:
 def parse_command_line() -> int:
     """helper function to get the user's arguments to ensure a proper start"""
 
-    global outdir, ann, popFile, vcf, tarFile, minVar, annPCA
+    global outdir, ann, popFile, vcf, tarFile, minVar, annPCA, convert_to_diploid
     
     desc  = "Generate a gene-specific PCA for the target genes using only exonic variants"
     ahelp = "Gene annotation file in GFF3/GTF format"
@@ -99,6 +100,7 @@ def parse_command_line() -> int:
     vhelp = "Vcf file containing samples found in --samples"
     mhelp = "Minimum number of variant sites required per gene"
     lhelp = "If set, label each point in the PCA with sample IDs"
+    hhelp = "If set, set haploid calls to diploid"
     
     parser = argparse.ArgumentParser(description=desc)
     parser.add_argument("-s", "--samples", required=True,  type=str, help=shelp)
@@ -108,6 +110,7 @@ def parse_command_line() -> int:
     parser.add_argument("-o", "--outdir",  default=outdir, type=str, help=ohelp)
     parser.add_argument("-m", "--min",     default=minVar, type=int, help=mhelp)
     parser.add_argument("-l", "--label",   action="store_true", help=lhelp)
+    parser.add_argument("-H", "--use-hap", action="store_true", help=hhelp)
 
     args = parser.parse_args()
     assert os.path.isfile(args.samples), f"Could not find {args.samples}"
@@ -124,6 +127,7 @@ def parse_command_line() -> int:
     outdir  = args.outdir.rstrip('/')
     minVar  = args.min
     annPCA  = args.label
+    convert_to_diploid = args.use_hap
 
     return 0
 
@@ -337,16 +341,18 @@ def get_overlapping_genes(left: int, pos: int, gene_list: list[Gene], gene_ends:
 def parse_vcf() -> int:
     """go through the vcf and find exonic variants for the target genes"""
 
-    global vcf, genes, samples
+    global vcf, genes, samples, convert_to_diploid
 
     samples_ls  = list()
     gene_ends   = list()
     chrom_genes = list()
     curChrom    = ''
     sites       = 0
+    skip_sites  = 0
     fh          = gzip.open(vcf, "rt") if vcf.endswith(".gz") else open(vcf, 'r')
-    genomap     =  {"0/0": 0, "0/1": 1, "1/0": 1, "1/1": 2,
-                    "0|0": 0, "0|1": 1, "1|0": 1, "1|1": 2}
+    genomap     = {"0/0": 0, "0/1": 1, "1/0": 1, "1/1": 2,
+                   "0|0": 0, "0|1": 1, "1|0": 1, "1|1": 2}
+    haploid_map = {"0": 0, "1": 2} # hemizygous calls scored as homozygous
 
     for line in fh:
         if (len(line) == 0):
@@ -394,39 +400,55 @@ def parse_vcf() -> int:
         if (left < len(chrom_genes)):
             gene  = chrom_genes[left]
             found = gene.start <= pos
-        if (found):
-            entries = list() # collect genes where the pos is exonic
-            get_overlapping_genes(left, pos, chrom_genes, gene_ends, entries)
+        if (found == False):
+            continue
+        entries = list() # collect genes where the pos is exonic
+        get_overlapping_genes(left, pos, chrom_genes, gene_ends, entries)
 
-            # position was intronic
-            if (len(entries) == 0):
-                continue
-            sites  += 1
-            # add each sample's genotype to each gene
-            fields     = line.split('\t')
-            fields[-1] = fields[-1].strip()
-            missing    = list()
-            total      = 0
-            count      = 0
-            for i in range(9, len(fields)):
-                sample = samples_ls[i - 9]
-                geno   = fields[i].split(':')[0]
-                if (geno.count('.') == 0):
-                    count += 1
-                    score  = genomap[geno]
-                    total += score
-                    for j in range(len(entries)):
-                        entries[j].add_genotype(sample, score)
+        # position was intronic
+        if (len(entries) == 0):
+            continue
+
+        # add each sample's genotype to each gene while being ploidy aware
+        fields     = line.split('\t')
+        fields[-1] = fields[-1].strip()
+        total      = 0
+        count      = 0
+        scores     = [-1] * len(samples_ls) # -1 = missing
+        skip       = False
+
+        for i in range(9, len(fields)):
+            geno   = fields[i].split(':')[0]
+            if (geno.count('.') > 0):
+                continue # missing data
+            try:
+                score  = genomap[geno]
+            except KeyError:
+                if (convert_to_diploid == True and geno in haploid_map):
+                    score = haploid_map[geno]
                 else:
-                    missing.append(sample)
-            # treat missing value as averages
-            score = 0 if total == 0 else total / count
-            for sample in missing:
-                for j in range(len(entries)):
-                    entries[j].add_genotype(sample, score)
+                    skip = True
+                    break
+            scores[i - 9] = score
+            total        += score
+            count        += 1
+        if (skip):
+            skip_sites += 1
+            continue
+        sites += 1
+        mean   = 0 if count == 0 else total / count # missing -> average
+        for i in range(len(samples_ls)):
+            sample = samples_ls[i]
+            score  = scores[i]
+            if (score == -1):
+                score = mean
+            for j in range(len(entries)):
+                entries[j].add_genotype(sample, score)
 
     fh.close()
 
+    if (skip_sites > 0):
+        print(f"Skipped {skip_sites} exonic sites with haploid or unexpected genotypes")
     if (sites == 0):
         sys.exit("No variant sites found in any target genes")
     else:
